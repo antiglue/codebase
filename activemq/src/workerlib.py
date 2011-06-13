@@ -326,9 +326,7 @@ class StatsConsumer(BaseConsumer):
             self.time = time.time()
             self.lastprocessed = event.headers['message-id']
             self.received += 1
-            logger.info('%d %d'% (self.time - self.lastobserv['time'], self.observdelay))
             if self.time - self.lastobserv['time'] > self.observdelay:
-                logger.info("Updating stats")
                 self.docs_s = (self.received - self.lastobserv['received']) / (self.time - self.lastobserv['time'])
                 self.lastobserv = {'time':self.time, 'received':self.received}
 
@@ -550,6 +548,22 @@ class AMQClientFactory:
         self.references[id(obj)] = obj
         return obj
 
+    def spawnConsumers(self, f, consumercount):
+        def startConsumer(c, i):
+            def _startConsumer():
+                logger.debug("Creating consumer %d" % i)
+                c.connect()
+                c.run()
+            return _startConsumer
+
+        processes = [ Process(target=startConsumer(self.createConsumer(f), i))  for i in range(consumercount)]
+        # avvio i processi consumer
+        logger.debug("Starting consumers")
+        for p in processes:
+            p.start()
+        logger.debug("Consumers started")
+        return processes
+
     def disconnectAll(self):
         for o in self.references.values():
             if o is not None:
@@ -575,32 +589,13 @@ def main():
         monitor = amqfactory.createConsumerClient()
         monitor.connect()
 
-        # funzione di comodo per poter avviare i consumer in processi separati, utile in questo test
-        def startConsumer(c):
-            def startc():
-                c.connect()
-                c.run()
-            return startc
-
+        processes = amqfactory.spawnConsumers(f, 3)
         # per avviare processo singolo:
         # c = amqfactory.createConsumer(f)
         # c.connect()
         # c.run()
 
-        # creo i processi consumer
-        processes = []
-        for i in range(3):
-            logger.info("Creating consumer %d" % i)
-            c = amqfactory.createConsumer(f)
-            processes.append(Process(target=startConsumer(c)))
-
-        # avvio i processi consumer
-        logger.debug("Starting consumers")
-        for p in processes:
-            p.start()
-        logger.debug("Consumers started")
-
-        # creo ed uso il consumer:
+        # creo ed uso il producer:
         # versione standard:
         """
         producer = amqfactory.createProducer()
