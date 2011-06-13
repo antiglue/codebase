@@ -231,6 +231,9 @@ class AMQClient(object):
         self.disconnect()
 
 class BaseConsumer(AMQClient):
+    """
+    Basic Consumer class. Wait for incoming message on a destination. Forwards received messages on Events
+    """
     COMMAND_HEADER = 'wl-cmd'
     SLEEP_EXIT = 0.1
 
@@ -298,6 +301,10 @@ class BaseConsumer(AMQClient):
             self.dispatcher.fire(event(headers=headers, message=message))
 
 class StatsConsumer(BaseConsumer):
+    """
+    A StatsConsumer adds statistics to BaseCosumer
+    """
+
     def __init__(self, amqparams, destination, params, ackmode):
         BaseConsumer.__init__(self, amqparams, destination, params, ackmode)
         self.stats = Consumer.Stats(self)
@@ -340,11 +347,10 @@ class Consumer(StatsConsumer):
     It terminates when a stop command is received. AMQClientfactory.stopConsumers can be used to broadcast shutdown messages.
 
     >>> def p(h,m): print h.m
-    >>> c = Consumer({'host_and_ports':[('localhost', 61116)]}, p, '/queue/social', '/topic/cmd' )
+    >>> c = Consumer({'host_and_ports':[('localhost', 61116)]}, p, {'/queue/social',{},'auto'}, {'/topic/cmd',{},'auto'} )
     >>> c.connect()
     >>> c.run()
     """ 
-
 
     def __init__(self, amqparams, processor, subscriptionparams, commandtopicparams):
         StatsConsumer.__init__(self, amqparams, *subscriptionparams)
