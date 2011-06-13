@@ -1,3 +1,4 @@
+#!/usr/bin/env python2.7
 # -*- encoding: utf-8 -*-
 
 import stomp
@@ -13,7 +14,7 @@ import os
 import socket
 import threading
 import weakref
-from functools import wraps
+from functools import wraps, partial
 from pprint import pprint as pp
 from pprint import pformat as pf
 from multiprocessing import Process
@@ -77,18 +78,20 @@ class EventDispatcher(object):
         if not self.handlers.has_key(event): return
         self.handlers[event].remove(handler)
 
+    def _find_handlers(self, obj):
+       return filter(lambda x: callable(x) and hasattr(x, 'events'), 
+                map(partial(getattr, obj), dir(obj)))
+ 
     def attach_listener(self, listener):
         # iterating over class method to find and register annotated handlers
-        for method in filter(callable, map(lambda x: not x.startswith('_') and getattr(listener,x), dir(listener))):
-            if hasattr(method, 'events'):
-                for event_type in method.events:
-                    self.add_handler(event_type, method)
+        for method in self._find_handlers(listener):
+            for event_type in method.events:
+                self.add_handler(event_type, method)
     
     def detach_listener(self, listener):
-        for method in filter(callable, map(lambda x: not x.startswith('_') and getattr(listener,x), dir(listener))):
-            if hasattr(method, 'events'):
-                for event_type in method.events:
-                    self.remove_handler(event_type, method)
+        for method in self._find_handlers(listener):
+            for event_type in method.events:
+                self.remove_handler(event_type, method)
 
     def fire(self, event, *args):
         event_type = type(event)
@@ -102,9 +105,8 @@ class EventDispatcher(object):
 
 def handle_events(*event_types):
     """
-    The handle_events decorator marks a target method as receiver
-    of specified events and is designed to be used on listener objects. 
-    A dispatcher can bind the decorated method to events using the attach_listener call
+    The handle_events decorator indicates that the decorated methods is a handler of the specified events.
+    Call dispatcher.attach_listener(methodOwner) to bind the listener.
     """
 
     def _handle_event(targetmethod):
@@ -232,7 +234,8 @@ class AMQClient(object):
 
 class BaseConsumer(AMQClient):
     """
-    Basic Consumer class. Wait for incoming message on a destination. Forwards received messages on Events
+    A basic Consumer class that listen for incoming message on a destination. 
+    The received messages are converted to Event and fired.
     """
     COMMAND_HEADER = 'wl-cmd'
     SLEEP_EXIT = 0.1
@@ -302,7 +305,8 @@ class BaseConsumer(AMQClient):
 
 class StatsConsumer(BaseConsumer):
     """
-    A StatsConsumer adds statistics to BaseCosumer
+    A StatsConsumer adds statistics and performance data to BaseCosumer.
+    Statistics are calculated intercepting incoming messages.
     """
 
     def __init__(self, amqparams, destination, params, ackmode):
@@ -341,13 +345,33 @@ class StatsConsumer(BaseConsumer):
 
 class Consumer(StatsConsumer):
     """
-    A Consumer is a process waiting for incoming messages on a queue and listen for commands on a topic.
-    It terminates when a stop command is received. AMQClientfactory.stopConsumers can be used to broadcast shutdown messages.
+    A Consumer is a process waiting for incoming messages on a queue and 
+    is listening for commands on a topic.
+    Received messages are forwarded to the "process" callback function to be processed
+    Supported Commands:
+    - ping
+    - stats
+    - stop
 
-    >>> def p(h,m): print h.m
-    >>> c = Consumer({'host_and_ports':[('localhost', 61116)]}, p, {'/queue/social',{},'auto'}, {'/topic/cmd',{},'auto'} )
+    >>> c = Consumer({'host_and_ports':[('localhost', 61116)]}, f, {'/queue/social',{},'auto'}, {'/topic/social_cmd',{},'auto'} )
     >>> c.connect()
     >>> c.run()
+    >>> c.disconnect()
+
+    Commands can be sent using ConsumerClient instances:
+
+    >>> def f(h,m): print h,m
+    >>> amqfactory = AMQClientFactory({'host_and_ports':[('localhost', 61116)]})
+    >>> amqfactory.spawnConsumers(f, 3)
+    >>> client = amqfactory.createConsumerClient()
+    >>> client.connect()
+    >>> time.sleep(3)
+    >>> assert len(client.ping()) == 3
+    >>> client.stopConsumers()
+    >>> assert len(client.ping()) == 0
+    >>> client.disconnect()
+ 
+    The consumer process will terminate if a stop command is received. 
     """ 
 
     def __init__(self, amqparams, processor, subscriptionparams, commandtopicparams):
@@ -355,8 +379,6 @@ class Consumer(StatsConsumer):
         self.processor = processor
         self.controller = Consumer.Controller(self, amqparams, (commandtopicparams[0], commandtopicparams[1], 'auto'))
         self.controllerthread = threading.Thread(target=self.startController)
-        #self.subscriptions = { 'input':(inputqueue, inputparams or {'activemq.priority':0, 'activemq.prefetchSize':1}, 'client'),
-        #                       'cmd': (commandtopic, {'activemq.priority':10}, 'auto') }
 
     def startController(self):
         with self.controller:
@@ -426,6 +448,15 @@ class Consumer(StatsConsumer):
             self.owner.disconnect()
 
 class ConsumerClient(AMQClient):
+    """
+    A ConsumerClient is responsible for communicating with Consumer via command topic.
+    It is able to:
+    - ping consumers
+    - query consumers about statistics
+    - stop consumers
+    Actaually it only support broadcasting, so every consumer will receive the command
+    """
+
     DEFAULT_TIMEOUT = 3
     def __init__(self, amqparams, commandtopic):
         AMQClient.__init__(self, amqparams)
@@ -590,13 +621,7 @@ def main():
         monitor.connect()
 
         processes = amqfactory.spawnConsumers(f, 3)
-        # per avviare processo singolo:
-        # c = amqfactory.createConsumer(f)
-        # c.connect()
-        # c.run()
-
         # creo ed uso il producer:
-        # versione standard:
         """
         producer = amqfactory.createProducer()
         producer.connect()
@@ -605,7 +630,7 @@ def main():
         producer.disconnect()
         """
 
-        time.sleep(3)
+        time.sleep(1)
         logger.info("PING:")
         logger.info(pf(monitor.ping()))
         # versione with(non necessita di connect e di disconnect:
@@ -632,6 +657,7 @@ def main():
         logger.debug("Run finished")
     except:
         traceback.print_exc()
+    finally:
         amqfactory.disconnectAll()
 
     print "fine main"
