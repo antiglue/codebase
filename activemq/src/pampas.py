@@ -1,25 +1,27 @@
 #!/usr/bin/env python2.7
 # -*- encoding: utf-8 -*-
 
-import stomp
-import logging
-import traceback
-import string
-import time
 import hashlib
-import random
-import pickle
-import sys
+import logging
 import os
+import pickle
+import random
 import socket
+import stomp
+import string
+import sys
 import threading
+import time
+import traceback
 import weakref
-from functools import wraps, partial
 from pprint import pprint as pp
 from pprint import pformat as pf
+from events import EventDispatcher, Event, handle_events
 from multiprocessing import Process
+from pipeline import Document, DocumentPipeline, ProcessorStatus, StageError
 
-logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(module)15s:%(name)10s:%(lineno)4d [%(levelname)6s]:  %(message)s")
+#logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(module)15s:%(name)10s:%(lineno)4d [%(levelname)6s]:  %(message)s")
+logging.config.fileConfig(os.path.join('etc', 'logging.conf'))
 logger = logging.getLogger()
 
 
@@ -34,109 +36,6 @@ class ConnectionError(Error):
     Base class for exceptions fired by this module
     """
     pass
-
-class EventDispatcher(object):
-    """
-    Dirty simple event handling: Dispatcher
-    A Dispatcher (or a subclass of Dispatcher) stores event handlers that are 'fired' when interesting things happen.
-
-    Create a dispatcher:
-    >>> d = Dispatcher()
-
-    Create a handler for the event and subscribe it to the dispatcher
-    to handle Event events.  A handler is a simple function or method that
-    accepts the event as an argument:
-
-    >>> def handler1(event): print event
-    >>> d.add_handler(Event, handler1)
-
-    Now dispatch a new event into the dispatcher, and see handler1 get
-    fired:
-
-    >>> d.fire(Event(foo='bar', data='dummy', used_by='the event handlers'))
-
-    The handle_events decorator can be used to mark event handler methods and let the dispather discovering them:
-
-    >>> class T(object):
-    ...     @handle_events(EventA,EventB)
-    ...     def handle(self, event):
-    ...             print event
-    >>> d.attach_listener(T())
-    >>> d.fire(Event())
- 
-    """
-
-    def __init__(self):
-        self.handlers = {}
-
-    def add_handler(self, event, handler):
-        if not self.handlers.has_key(event):
-            self.handlers[event] = []
-        self.handlers[event].append(handler)
-
-    def remove_handler(self, event, handler):
-        if not self.handlers.has_key(event): return
-        self.handlers[event].remove(handler)
-
-    def _find_handlers(self, obj):
-       return filter(lambda x: callable(x) and hasattr(x, 'events'), 
-                map(partial(getattr, obj), dir(obj)))
- 
-    def attach_listener(self, listener):
-        # iterating over class method to find and register annotated handlers
-        for method in self._find_handlers(listener):
-            for event_type in method.events:
-                self.add_handler(event_type, method)
-    
-    def detach_listener(self, listener):
-        for method in self._find_handlers(listener):
-            for event_type in method.events:
-                self.remove_handler(event_type, method)
-
-    def fire(self, event, *args):
-        event_type = type(event)
-        if not event_type in self.handlers: return
-
-        for handler in self.handlers[event_type]:
-            try:
-                handler(event, *args)
-            except: # non ammesse eccezioni
-                traceback.print_exc()
-
-def handle_events(*event_types):
-    """
-    The handle_events decorator indicates that the decorated methods is a handler of the specified events.
-    Call dispatcher.attach_listener(methodOwner) to bind the listener.
-    """
-
-    def _handle_event(targetmethod):
-        @wraps(targetmethod)
-        def handler(*args, **kwds):
-            return targetmethod(*args, **kwds)
-        handler.events = event_types
-        return handler
-    return _handle_event
-        
-class Event(object):
-    """
-    An event is a container for attributes.  The source of an event
-    creates this object, or a subclass, gives it any kind of data that
-    the events handlers need to handle the event, and then calls
-    notify(event).
-
-    The target of an event registers a function to handle the event it
-    is interested with subscribe().  When a sources calls
-    notify(event), each subscriber to that even will be called i no
-    particular order.
-    """
-
-    def __init__(self, **kw):
-        self.__dict__.update(kw)
-
-    def __repr__(self):
-        attrs = self.__dict__.keys()
-        attrs.sort()
-        return '<events.%s %s>' % (self.__class__.__name__, [a for a in attrs],)
 
 class AmqErrorEvent(Event):
     """
@@ -483,7 +382,7 @@ class ConsumerClient(AMQClient):
 
     def on_message(self, headers, message):
         stats = pickle.loads(message)
-        logger.info("Client %s Received response from: %s - %s" % (self.cid, str(stats), headers['id']))
+        logger.debug("Client %s Received response from: %s - %s" % (self.cid, str(stats), headers['id']))
         self.resultholder.setdefault(headers[Consumer.COMMAND_HEADER], {}).setdefault(headers['correlation-id'], []).append(stats)
 
     def ping(self, timeout = DEFAULT_TIMEOUT, expectedcount = -1):
@@ -499,7 +398,7 @@ class ConsumerClient(AMQClient):
                         'correlation-id': correlationid,
                         'priority':127 })
         self.resultholder.setdefault(cmd,{})[correlationid] = []
-        logger.info("Sending %s request to: %s" % (cmd, self.commandtopic))
+        logger.debug("Sending %s request to: %s" % (cmd, self.commandtopic))
         try:
             self.send(message=message, headers=headers,
                       destination=self.commandtopic, ack='auto')
@@ -582,6 +481,9 @@ class AMQClientFactory:
     def spawnConsumers(self, f, consumercount):
         def startConsumer(c, i):
             def _startConsumer():
+                logging.config.fileConfig(os.path.join('etc', 'logging.conf'))
+                global logger
+                logger = logging.getLogger()
                 logger.debug("Creating consumer %d" % i)
                 c.connect()
                 c.run()
@@ -599,6 +501,40 @@ class AMQClientFactory:
         for o in self.references.values():
             if o is not None:
                 o.disconnect()
+
+
+class PipelineProcessor:
+    """
+    A PipelineProcessor forwards incoming messages to a pipeline of stages
+    """
+
+    def __init__(self, pipelinename, pipelineconfigdir):
+        self.pipeline = DocumentPipeline(pipelinename)
+        self.pipeline.init(pipelineconfigdir)
+
+    def makeDocument(self, header, message):
+        if isinstance(message, dict):
+            doc = Document(message)
+            dpc.Set('amqheaders', header)
+        elif isinstance(message, str):
+            doc = Document(header)
+            doc.Set('body', message)
+        else:
+            raise Exception("Not implemented")
+        return doc
+
+    def process(self, header, message):
+        doc = self.makeDocument(header, message)
+        try:
+            status = self.pipeline.process(doc)
+            if status not in [ProcessorStatus.OK, ProcessorStatus.OK_NoChange]:
+                print "Error processing %s in %s" % (header['message-id'], self.pipeline.getLastProcessed())
+        except StageError, ex:
+            traceback.print_exc()
+            print "Unhandled stage error: %s" % str(ex)        
+
+    def __call__(self, header, message):
+        self.process(header, message)
 
 def main():
     # parametri di connessione ad ActiveMQ
