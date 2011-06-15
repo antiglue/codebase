@@ -505,52 +505,8 @@ class AMQClientFactory:
             if o is not None:
                 o.disconnect()
 
-# to be moved
-from pipeline import Document, DocumentPipeline, ProcessorStatus, StageError
-class PipelineProcessor:
-    """
-    A PipelineProcessor forwards incoming messages to a pipeline of stages
-    """
-
-    def __init__(self, pipelinename, pipelineconfigdir):
-        self.pipeline = DocumentPipeline(pipelinename)
-        self.pipeline.init(pipelineconfigdir)
-
-    def makeDocument(self, header, message):
-        if isinstance(message, dict):
-            doc = Document(message)
-            dpc.Set('amqheaders', header)
-        elif isinstance(message, str):
-            doc = Document(header)
-            doc.Set('body', message)
-        else:
-            raise Exception("Not implemented")
-        return doc
-
-    def process(self, header, message):
-        doc = self.makeDocument(header, message)
-        try:
-            status = self.pipeline.process(doc)
-            if status not in [ProcessorStatus.OK, ProcessorStatus.OK_NoChange]:
-                logger.error("Error processing %s in %s" % (header['message-id'], self.pipeline.getLastProcessed()))
-        except StageError, ex:
-            logger.warning("Unhandled stage error: %s" % str(ex))
-            logger.exception(ex)
-
-    def __call__(self, header, message):
-        self.process(header, message)
 
 def main():
-    suite = unittest.TestLoader().loadTestsFromTestCase(TestMySQLDbInserter)
-    unittest.TextTestRunner(verbosity=2).run(suite)
-
-    """
-    mdb = MySQLDbPlus()
-    mdb.connect('localhost', 'liquida', 'liquida', 'liquida')
-    while True:
-        print mdb.execute("select VERSION()").fetchone()
-        time.sleep(1)
-    """ 
     # parametri di connessione ad ActiveMQ
     amqparams = {'host_and_ports':[('localhost', 61116)]}
     # coda di input dei messaggi
