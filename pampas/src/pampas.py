@@ -8,7 +8,6 @@ import pickle
 import random
 import socket
 import stomp
-import string
 import sys
 import threading
 import time
@@ -18,7 +17,6 @@ from pprint import pprint as pp
 from pprint import pformat as pf
 from events import EventDispatcher, Event, handle_events
 from multiprocessing import Process
-from pipeline import Document, DocumentPipeline, ProcessorStatus, StageError
 
 logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(module)15s:%(name)10s:%(lineno)4d [%(levelname)6s]:  %(message)s")
 #logging.config.fileConfig(os.path.join('etc', 'logging.conf'))
@@ -85,7 +83,7 @@ class AMQClient(object):
             self.connection.start()
             self.connection.connect(wait=True)
             logger.debug("Connected.")
-        except stomp.exception.ReconnectFailedException, e:
+        except stomp.exception.ReconnectFailedException:
             logger.warning("Connection error")
             trace = sys.exc_info()[2]
             raise ConnectionError('Connection failed!'), None, trace
@@ -134,7 +132,7 @@ class AMQClient(object):
 class BaseConsumer(AMQClient):
     """
     A basic Consumer class that listen for incoming message on a destination. 
-    The received messages are converted to Event and fired.
+    Received messages are dispatched to methods as events
     """
     COMMAND_HEADER = 'wl-cmd'
     SLEEP_EXIT = 0.1
@@ -144,7 +142,7 @@ class BaseConsumer(AMQClient):
         self.can_run = False
         self.listener = BaseConsumer.AMQListener(self.connection)
         self.listener.attach_listener(self)
-        self.connection.set_listener('consumer', self.listener)
+        self.connection.set_listener(self.cid, self.listener)
         self.subscriptionparams = (destination, params, ackmode)
 
     def connect(self):
@@ -381,9 +379,14 @@ class ConsumerClient(AMQClient):
                   destination=self.commandtopic, ack='auto')
 
     def on_message(self, headers, message):
-        stats = pickle.loads(message)
-        logger.debug("Client %s Received response from: %s - %s" % (self.cid, str(stats), headers['id']))
-        self.resultholder.setdefault(headers[Consumer.COMMAND_HEADER], {}).setdefault(headers['correlation-id'], []).append(stats)
+        data = pickle.loads(message)
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("Client %s Received response from: %s - %s" % (self.cid, str(data), headers['id']))
+
+        cmd = headers[Consumer.COMMAND_HEADER]
+        correlationid = headers['correlation-id']
+        if cmd in self.resultholder and correlationid in self.resultholder[cmd]:
+            self.resultholder[cmd][correlationid].append(data)
 
     def ping(self, timeout = DEFAULT_TIMEOUT, expectedcount = -1):
         return self.execute('PingEvent', timeout, expectedcount)
@@ -502,52 +505,8 @@ class AMQClientFactory:
             if o is not None:
                 o.disconnect()
 
-import MySQLdb
-class MySQLDbPlus(object):
-    def __init__(self, max_reconnection_attempt = 3, reconnection_delay_seconds = 10):
-        self.connection = None
-        self.connectionargs = None
-        self.max_reconnection_attempt = max_reconnection_attempt
-        self.reconnection_delay_seconds = reconnection_delay_seconds
-        self.current_attempt = 0
-
-    def connect(self, *args):
-        self.connectionargs = args
-        try:
-            self.connection = MySQLdb.connect(*args)
-            self.cursor = self.connection.cursor()
-            self.current_attempt = 0
-        except (AttributeError, MySQLdb.OperationalError):
-            if self.current_attempt >= self.max_reconnection_attempt:
-                raise
-            logger.warning("Connection failed. Current attempt:%d" % self.current_attempt)
-            logger.info(traceback.format_exc())
-            self.current_attempt += 1
-            time.sleep(self.reconnection_delay_seconds)
-            self.connect(*args)
-            
-    def execute(self, stmt):
-        try:
-            self.cursor.execute(stmt)
-        except (AttributeError, MySQLdb.OperationalError):
-            self.connect(*self.connectionargs)
-            self.cursor.execute(stmt)
-        return self.cursor
-
-import unittest
-class TestMySQLDbPlus(unittest.TestCase):
-    def setUp():
-        pass
-
-    def testReconnection(self):
-        mdb = MySQLDbPlus()
-        mdb.connect('localhost', 'liquida', 'liquida', 'liquida')
-        while True:
-            print mdb.execute("select VERSION()").fetchone()
-            time.sleep(1)
-
-    def tearDown():
-        pass
+# to be moved
+from pipeline import Document, DocumentPipeline, ProcessorStatus, StageError
 class PipelineProcessor:
     """
     A PipelineProcessor forwards incoming messages to a pipeline of stages
@@ -582,12 +541,16 @@ class PipelineProcessor:
         self.process(header, message)
 
 def main():
+    suite = unittest.TestLoader().loadTestsFromTestCase(TestMySQLDbInserter)
+    unittest.TextTestRunner(verbosity=2).run(suite)
+
+    """
     mdb = MySQLDbPlus()
     mdb.connect('localhost', 'liquida', 'liquida', 'liquida')
     while True:
         print mdb.execute("select VERSION()").fetchone()
         time.sleep(1)
-        
+    """ 
     # parametri di connessione ad ActiveMQ
     amqparams = {'host_and_ports':[('localhost', 61116)]}
     # coda di input dei messaggi
