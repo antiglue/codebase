@@ -3,6 +3,8 @@
 import pampas
 import unittest
 import time
+import logging
+logging.basicConfig(level=logging.DEBUG, format="[%(asctime)s] %(module)15s:%(name)10s:%(lineno)4d [%(levelname)6s]:  %(message)s")
 
 def testf(headers, message):
     print "testf", message
@@ -13,32 +15,66 @@ class TestPipelineProcessor(unittest.TestCase):
         self.destination = '/queue/test'
         self.factory = pampas.AMQClientFactory(self.amqparams)
         self.factory.setMessageQueue(self.destination)
+        #self.proc = pampas.PipelineProcessor('testpipe', './etc')
         monitor = self.factory.createConsumerClient()
         monitor.connect()
         self.monitor = monitor
-        #self.proc = pampas.PipelineProcessor('testpipe', './etc')
+        self.procs = []
 
-    def testFactory(self):
-        expectedmessage = 20
+    def testASpawnProcess(self):
         print "Spawning 3 workers"
         #procs = self.factory.spawnConsumers(self.proc, 3)
-        procs = self.factory.spawnConsumers(testf, 3)
-        time.sleep(3)
+        self.procs = self.factory.spawnConsumers(testf, 3)
+        try:
+            time.sleep(3)
+        except KeyboardInterrupt:
+            self.factory.disconnectAll()
+            raise SystemExit()
+
         print "Process spawned. Testing..."
         self.assertEqual(len(self.monitor.ping()), 3)
+       
 
+    def testProducer(self):
+        expectedmessage = 20
         print "Sending test messages..."
         with self.factory.createProducer() as producer:
             for i in range(expectedmessage):
-                producer.sendMessage("test", headers={'url':'http://www.liquida.it/%d' % i})
+                producer.sendMessage("test%d" % i, headers={'url':'http://www.liquida.it/%d' % i})
 
         print "Messages sent, waiting for consumers"
-        time.sleep(3)
+        try:
+            time.sleep(3)
+        except KeyboardInterrupt:
+            self.factory.disconnectAll()
+            raise SystemExit()
         self.assertEqual(reduce(lambda tot, stat: tot + stat['received'], self.monitor.stats(), 0), expectedmessage)
 
+    def testProducerBatch(self):
+        expectedmessage = 20
+        print "Sending test messages..."
+        with self.factory.createBufferedProducer(15) as producer:
+            for i in range(expectedmessage):
+                producer.sendMessage("test%d" % i, headers={'url':'http://www.liquida.it/%d' % i})
+
+        print "Messages sent, waiting for consumers"
+        try:
+            time.sleep(3)
+        except KeyboardInterrupt:
+            self.factory.disconnectAll()
+            raise SystemExit()
+        self.assertEqual(reduce(lambda tot, stat: tot + stat['received'], self.monitor.stats(), 0), expectedmessage + 20)
+
+
+    def testZStopConsumers(self):
         print "Stopping consumer"
         self.monitor.stopConsumers()
-        time.sleep(3)
+        try:
+            time.sleep(3)
+        except KeyboardInterrupt:
+            self.factory.disconnectAll()
+            raise SystemExit()
+
         self.assertEqual(len(self.monitor.ping()),  0)
         
     def testProcessing(self):

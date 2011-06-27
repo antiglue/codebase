@@ -8,6 +8,7 @@ class MySQLDbInserter(object):
     def __init__(self, max_reconnection_attempt = 3, reconnection_delay_seconds = 10):
         self.connection = None
         self.connectionargs = None
+        self.cursor = None
         self.max_reconnection_attempt = max_reconnection_attempt
         self.reconnection_delay_seconds = reconnection_delay_seconds
         self.current_attempt = 0
@@ -51,6 +52,9 @@ class MySQLDbInserter(object):
         self.commitlock.release()
 
     def execute(self, stmt):
+        if not self.cursor:
+            raise MySQLdb.NotConnectedException()
+
         try:
             self.cursor.execute(stmt)
         except (AttributeError, MySQLdb.OperationalError):

@@ -53,6 +53,12 @@ class MessageEvent(Event):
     """
     pass
 
+class MessageProcessedEvent(Event):
+    """
+    A MessageProcessedEvent is fired by AMQListener at the end 
+    """
+    pass
+
 class StatsEvent(Event):
     """
     A StatsEvent
@@ -65,6 +71,7 @@ class PingEvent(Event):
     """
     pass
 
+       
 class AMQClient(object):
     """
     An AMQClient handles basic stomp operations such as connect, send and disconnect.
@@ -88,8 +95,11 @@ class AMQClient(object):
             trace = sys.exc_info()[2]
             raise ConnectionError('Connection failed!'), None, trace
 
+    def isconnected(self):
+        return self.connection and self.connection.is_connected()
+
     def disconnect(self):
-        if self.connection and self.connection.is_connected():
+        if self.isconnected():
             if self.subscriptions:
                 for subscr in self.subscriptions:
                     self.unsubscribe(subscr)
@@ -129,6 +139,15 @@ class AMQClient(object):
     def __del__(self):
         self.disconnect()
 
+class ErrorStrategies:
+    ERROR_SILENTLY = 2
+    ERROR_LOG = 2<<1
+    ERROR_DLQ = 2<<2
+    ERROR_STOP = 2<<3
+    ERROR_FAIL = 2<<4
+    ERROR_USER_FUNCT = 2<<5
+
+
 class BaseConsumer(AMQClient):
     """
     A basic Consumer class that listen for incoming message on a destination. 
@@ -144,6 +163,7 @@ class BaseConsumer(AMQClient):
         self.listener.attach_listener(self)
         self.connection.set_listener(self.cid, self.listener)
         self.subscriptionparams = (destination, params, ackmode)
+        self.ackneeded = ackmode == 'client'
 
     def connect(self):
         AMQClient.connect(self)
@@ -156,13 +176,21 @@ class BaseConsumer(AMQClient):
         AMQClient.disconnect(self)
         self.can_run = False
 
+    def ack(self, headers = None):
+        self.connection.ack(headers=headers or {})
+
     def run(self):
         while self.can_run:
             try: 
                 time.sleep(BaseConsumer.SLEEP_EXIT)
             except KeyboardInterrupt:
                 self.disconnect()
+                raise SystemExit()
 
+    @handle_events(MessageProcessedEvent)
+    def on_message_processed(self, event):
+        if self.ackneeded:
+            self.ack(event.headers)
 
     class AMQListener(stomp.ConnectionListener):
         """
@@ -173,6 +201,7 @@ class BaseConsumer(AMQClient):
         def __init__(self, connection):
             self.connection = connection
             self.dispatcher = EventDispatcher()
+            self.messagelock = threading.Lock()
         
         def attach_listener(self, listener):
             self.dispatcher.attach_listener(listener)
@@ -186,6 +215,8 @@ class BaseConsumer(AMQClient):
 
         def on_message(self, headers, message):
             logger.debug("Received: %s" % str((headers, message)))
+            self.messagelock.acquire()
+
             event = MessageEvent
             if BaseConsumer.COMMAND_HEADER in headers:
                 logger.debug('Got %s COMMAND' % message)
@@ -198,7 +229,67 @@ class BaseConsumer(AMQClient):
                     logger.debug('header: key %s , value %s' %(k,v))
                 logger.debug('body: %s'% message)
 
-            self.dispatcher.fire(event(headers=headers, message=message))
+            if 'buffersize' in headers:
+                for m in pickle.loads(message):
+                    self.dispatcher.fire(event(headers=headers, message=m))
+            else:
+                self.dispatcher.fire(event(headers=headers, message=message))
+
+            self.dispatcher.fire(MessageProcessedEvent(headers=headers, message=message))
+
+            self.messagelock.release()
+
+    class ErrorStrategy(object):
+        def __init__(self, owner):
+            self.owner = owner
+
+        def __call__(self, event):
+            pass
+
+    class ErrorLogStrategy(ErrorStrategy):
+        def __init__(self, owner, level = logging.WARNING, logstacktrace = True, logfullmessage = False):
+            ErrorStrategy.__init__(self, owner)
+            self.level = level
+            self.logfullmessage = logfullmessage
+            self.logstacktrace = logstacktrace
+
+        def __call__(self, event):
+            logger.log(self.level, '%s: "%s" - Message={headers:"%s", message="%s"}' % 
+                                    (event.exc_description,
+                                     str(event.exc_cause), 
+                                     str(event.headers), 
+                                     str(event.message) if self.logfullmessage else '...'))
+            if self.logstacktrace:
+                logger.exception(event.exc_cause)
+
+    class ErrorDLQStrategy(ErrorStrategy):
+        def __init__(self, owner, destination, params):
+            ErrorStrategy.__init__(self, owner)
+            self.destination = destination
+     
+        def __call__(self, event):
+            headers = {'errorType': str(event.exc_cause), 
+                       'errorDesc': event.exc_description}
+            headers.update(event.headers)
+            self.owner.send(message=event.message, headers=headers, 
+                            destination=self.destination, ack='auto')
+
+    class ErrorStopStrategy(ErrorStrategy):
+        def __call__(self, event):
+            self.owner.disconnect()
+
+    class ErrorFailStrategy(ErrorStrategy):
+        def __call__(self, event):
+            raise event.exc_cause
+
+    class ErrorUserFunctStrategy(ErrorStrategy):
+        def __init__(self, owner, callback):
+            ErrorStrategy.__init__(self, owner)
+            self.callback = callback
+
+        def __call__(self, event):
+            self.callback(event)
+
 
 class StatsConsumer(BaseConsumer):
     """
@@ -208,10 +299,10 @@ class StatsConsumer(BaseConsumer):
 
     def __init__(self, amqparams, destination, params, ackmode):
         BaseConsumer.__init__(self, amqparams, destination, params, ackmode)
-        self.stats = Consumer.Stats(self)
+        self.stats = Consumer.StatsDelegate(self)
         self.listener.attach_listener(self.stats)
 
-    class Stats(object):
+    class StatsDelegate(object):
         def __init__(self, owner):
             self.owner = owner
             self.received = 0
@@ -223,7 +314,7 @@ class StatsConsumer(BaseConsumer):
             self.idledelay = 3
 
         @handle_events(MessageEvent)
-        def onMessageEvent(self, event):
+        def on_message_event(self, event):
             self.time = time.time()
             self.lastprocessed = event.headers['message-id']
             self.received += 1
@@ -274,10 +365,10 @@ class Consumer(StatsConsumer):
     def __init__(self, amqparams, processor, subscriptionparams, commandtopicparams):
         StatsConsumer.__init__(self, amqparams, *subscriptionparams)
         self.processor = processor
-        self.controller = Consumer.Controller(self, amqparams, (commandtopicparams[0], commandtopicparams[1], 'auto'))
-        self.controllerthread = threading.Thread(target=self.startController)
+        self.controller = Consumer.ControllerDelegate(self, amqparams, (commandtopicparams[0], commandtopicparams[1], 'auto'))
+        self.controllerthread = threading.Thread(target=self.start_controller)
 
-    def startController(self):
+    def start_controller(self):
         with self.controller:
             self.controller.run()
 
@@ -292,54 +383,52 @@ class Consumer(StatsConsumer):
         StatsConsumer.disconnect(self)
 
     @staticmethod
-    def pingMessage():
+    def pingmessage():
         return ({BaseConsumer.COMMAND_HEADER:'PingEvent'},'ping')
 
     @staticmethod
-    def stopMessage():
+    def stopmessage():
         return ({BaseConsumer.COMMAND_HEADER:'StopWorkerEvent'},'stop')
 
     @staticmethod
-    def statsMessage():
+    def statsmessage():
         return ({BaseConsumer.COMMAND_HEADER:'StatsEvent'},'stats')
 
-
     @handle_events(MessageEvent)
-    def onMessageEvent(self, event):
+    def on_message_event(self, event):
         logger.debug("CID %s:Received message: %s" % (self.cid, event))
         try:
             self.processor(event.headers, event.message)
-            self.connection.ack(event.headers)
         except Exception as ex:
             logger.warning("Catched processor exception:")
             logger.exception(ex)
 
-    class Controller(BaseConsumer):
+    class ControllerDelegate(BaseConsumer):
         def __init__(self, owner, amqparams, subscriptionparams):
             BaseConsumer.__init__(self, amqparams, *subscriptionparams)
             self.owner = owner
 
         @handle_events(AmqErrorEvent)
-        def onAmqErrorEvent(self, event):
+        def on_amqerror_event(self, event):
             logger.debug("received error: %s" % event)
             self.owner.disconnect()
 
         @handle_events(StatsEvent)
-        def onStatsEvent(self, event):
+        def on_stats_event(self, event):
             logger.debug("received stats request: %s" % event)
             self.send(message=pickle.dumps(self.owner.stats.getdata()), headers={'correlation-id':event.headers['correlation-id'], 
                                                                                  self.COMMAND_HEADER:'StatsEvent'},
                       destination=event.headers['reply-to'], ack='auto')
 
         @handle_events(PingEvent)
-        def onPingEvent(self, event):
+        def on_ping_event(self, event):
             logger.debug("received ping request: %s" % event)
             self.send(message=pickle.dumps({'pong':self.owner.cid}), headers={'correlation-id':event.headers['correlation-id'], 
                                                                          self.COMMAND_HEADER:'PingEvent'},
                       destination=event.headers['reply-to'], ack='auto')
 
         @handle_events(StopWorkerEvent)
-        def onStopWorkerEvent(self, event):
+        def on_stopworker_event(self, event):
             logger.debug("received stop: %s" % event)
             self.disconnect()
             self.owner.disconnect()
@@ -374,28 +463,19 @@ class ConsumerClient(AMQClient):
         AMQClient.disconnect(self)
 
     def stopConsumers(self):
-        headers, message = Consumer.stopMessage()
+        headers, message = Consumer.stopmessage()
         self.send(message=message, headers=headers,
                   destination=self.commandtopic, ack='auto')
 
-    def on_message(self, headers, message):
-        data = pickle.loads(message)
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug("Client %s Received response from: %s - %s" % (self.cid, str(data), headers['id']))
-
-        cmd = headers[Consumer.COMMAND_HEADER]
-        correlationid = headers['correlation-id']
-        if cmd in self.resultholder and correlationid in self.resultholder[cmd]:
-            self.resultholder[cmd][correlationid].append(data)
-
     def ping(self, timeout = DEFAULT_TIMEOUT, expectedcount = -1):
-        return self.execute('PingEvent', timeout, expectedcount)
+        return self.send_receive(Consumer.pingmessage(), timeout, expectedcount)
 
     def stats(self, timeout = DEFAULT_TIMEOUT, expectedcount = -1):
-        return self.execute('StatsEvent', timeout, expectedcount)
+        return self.send_receive(Consumer.statsmessage(), timeout, expectedcount)
 
-    def execute(self, cmd, timeout, expectedcount):
-        headers, message = getattr(Consumer, '%sMessage' % cmd.replace('Event','').lower())()
+    def send_receive(self, cmdmsg, timeout, expectedcount):
+        headers, message = cmdmsg
+        cmd = headers[BaseConsumer.COMMAND_HEADER]
         correlationid = '%s.%d' % (self.cid, self.counter)
         headers.update({'reply-to': self.replyqueue,
                         'correlation-id': correlationid,
@@ -407,10 +487,19 @@ class ConsumerClient(AMQClient):
                       destination=self.commandtopic, ack='auto')
             self.counter += 1
             if expectedcount > 0:
-                while len(self.resultholder[cmd][correlationid]) < expectedcount:
-                    time.sleep(1)
+                while len(self.resultholder[cmd][correlationid]) < expectedcount and timeout > 0:
+                    try:
+                        time.sleep(1)
+                        timeout -= 1
+                    except KeyboardInterrupt:
+                        raise SystemExit()
+
             else:
-                time.sleep(timeout)
+                try:
+                    time.sleep(timeout)
+                except KeyboardInterrupt:
+                    raise SystemExit()
+
             ret = self.resultholder[cmd].pop(correlationid)
             return ret
         except KeyboardInterrupt:
@@ -419,7 +508,17 @@ class ConsumerClient(AMQClient):
             traceback.print_exc()
             return []
 
-    
+    def on_message(self, headers, message):
+        data = pickle.loads(message)
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("Client %s Received response from: %s - %s" % (self.cid, str(data), headers['id']))
+
+        cmd = headers[Consumer.COMMAND_HEADER]
+        correlationid = headers['correlation-id']
+        if cmd in self.resultholder and correlationid in self.resultholder[cmd]:
+            self.resultholder[cmd][correlationid].append(data)
+
+   
 class Producer(AMQClient):
     def __init__(self, amqparams, destination, defaultheaders = None):
         AMQClient.__init__(self, amqparams)
@@ -431,6 +530,43 @@ class Producer(AMQClient):
                    (headers or {}).items() )
         self.send(message=message, headers=hs,
                   destination=self.destination, ack='client')
+
+class DynamicProxy(object):
+    def __init__(self, target):
+        self.real = target
+
+    def __getattr__(self, name):
+        return getattr(self.real, name)
+
+class BufferedProducer(DynamicProxy):
+    def __init__(self, producer, buffersize):
+        DynamicProxy.__init__(self, producer)
+        self.buffersize = buffersize
+        self.buffer = []
+
+    def sendMessage(self, message, headers = None):
+        self.buffer.append((message, headers))
+        if len(self.buffer) >= self.buffersize:
+            batchmessage = pickle.dumps(self.buffer)
+            self.real.sendMessage(batchmessage, headers = {'buffersize':len(self.buffer)})
+            del self.buffer[:]
+
+    def flush(self):
+        if self.buffer:
+            batchmessage = pickle.dumps(self.buffer)
+            self.real.sendMessage(batchmessage, headers = {'buffersize':len(self.buffer)})
+            del self.buffer[:]
+
+    def disconnect(self):
+        self.flush()
+        self.real.disconnect()
+
+    def __exit__(self, type, value, tb):
+        self.disconnect()
+
+    def __enter__(self):
+        self.real.__enter__()
+        return self
 
 class AMQClientFactory:
     """
@@ -465,6 +601,12 @@ class AMQClientFactory:
         self.references[id(obj)] = obj
         return obj
 
+    def createBufferedProducer(self, buffersize, messagequeue = None, defaultheaders = None):
+        if not messagequeue and not 'messagequeue' in self.params:
+            raise NameError("Cannot create producer. No message queue set! Please set the messagequeue argument or call setMessageQueue before")
+        obj = BufferedProducer(Producer(self.params['amqparams'], messagequeue or self.params['messagequeue'], defaultheaders), buffersize)
+        self.references[id(obj)] = obj
+        return obj
 
     def createConsumer(self, acallable, messagequeue = None, commandtopic = None):
         if not messagequeue and not 'messagequeue' in self.params:
@@ -528,22 +670,22 @@ def main():
 
         processes = amqfactory.spawnConsumers(f, 3)
         # creo ed uso il producer:
-        """
-        producer = amqfactory.createProducer()
-        producer.connect()
-        for i in range(10):
-            producer.sendMessage("ciao")
-        producer.disconnect()
-        """
 
         time.sleep(1)
         logger.info("PING:")
         logger.info(pf(monitor.ping()))
         # versione with(non necessita di connect e di disconnect:
+        """
         with amqfactory.createProducer() as producer:
             for i in range(40):
                producer.sendMessage("messaggio%d" % i)
- 
+        """
+        producer = BufferedProducer(amqfactory.createProducer(), 10)
+        producer.connect()
+        for i in range(15):
+            producer.sendMessage("ciao")
+        producer.disconnect()
+
         logger.info(pf(monitor.ping()))
 
         logger.info("Sleeping 5 seconds before stopping workers!")

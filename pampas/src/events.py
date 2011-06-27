@@ -21,14 +21,14 @@ class EventDispatcher(object):
 
     >>> d.fire(Event(foo='bar', data='dummy', used_by='the event handlers'))
 
-    The handle_events decorator can be used to mark event handler methods and let the dispather discovering them:
+    The handle_events decorator can be used to mark event handler methods and let the dispatcher discovering them:
 
     >>> class T(object):
     ...     @handle_events(EventA,EventB)
     ...     def handle(self, event):
     ...             print event
     >>> d.attach_listener(T())
-    >>> d.fire(Event())
+    >>> d.fire(EventA())
  
     """
 
