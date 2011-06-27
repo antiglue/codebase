@@ -215,29 +215,27 @@ class BaseConsumer(AMQClient):
 
         def on_message(self, headers, message):
             logger.debug("Received: %s" % str((headers, message)))
-            self.messagelock.acquire()
+            with self.messagelock:
+                event = MessageEvent
+                if BaseConsumer.COMMAND_HEADER in headers:
+                    logger.debug('Got %s COMMAND' % message)
+                    event = globals().get(headers[Consumer.COMMAND_HEADER], None)
+                    assert event
 
-            event = MessageEvent
-            if BaseConsumer.COMMAND_HEADER in headers:
-                logger.debug('Got %s COMMAND' % message)
-                event = globals().get(headers[Consumer.COMMAND_HEADER], None)
-                assert event
+                if self.DEBUG_MESSAGE and logger.isEnabledFor(logging.DEBUG):
+                    logger.debug("Received message:")
+                    for k,v in headers.iteritems():
+                        logger.debug('header: key %s , value %s' %(k,v))
+                    logger.debug('body: %s'% message)
 
-            if self.DEBUG_MESSAGE and logger.isEnabledFor(logging.DEBUG):
-                logger.debug("Received message:")
-                for k,v in headers.iteritems():
-                    logger.debug('header: key %s , value %s' %(k,v))
-                logger.debug('body: %s'% message)
+                if 'buffersize' in headers:
+                    for m in pickle.loads(message):
+                        self.dispatcher.fire(event(headers=headers, message=m))
+                else:
+                    self.dispatcher.fire(event(headers=headers, message=message))
 
-            if 'buffersize' in headers:
-                for m in pickle.loads(message):
-                    self.dispatcher.fire(event(headers=headers, message=m))
-            else:
-                self.dispatcher.fire(event(headers=headers, message=message))
+                self.dispatcher.fire(MessageProcessedEvent(headers=headers, message=message))
 
-            self.dispatcher.fire(MessageProcessedEvent(headers=headers, message=message))
-
-            self.messagelock.release()
 
     class ErrorStrategy(object):
         def __init__(self, owner):
