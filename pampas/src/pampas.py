@@ -534,6 +534,7 @@ class ConsumerClient(object):
     def on_message(self, headers, message):
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("Client %s Received response from: %s - %s" % (self.cid, str(message), headers['id']))
+        logger.debug("Client %s Received response from: %s - %s" % (self.cid, str(message), headers['id']))
 
         cmd = headers[COMMAND_HEADER]
         correlationid = headers['correlation-id']
