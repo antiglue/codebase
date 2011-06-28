@@ -14,6 +14,7 @@ import time
 import traceback
 import weakref
 import json
+import base64
 from pprint import pprint as pp
 from pprint import pformat as pf
 from events import EventDispatcher, Event, handle_events
@@ -74,10 +75,10 @@ class PingEvent(Event):
 
 class JSONEncoder(object):
     def encode(self, data):
-        return json.dumps(data)
+        return base64.b64encode(json.dumps(data))
 
     def decode(self, data):
-        return json.loads(data)
+        return json.loads(base64.b64decode(data))
 
 COMMAND_HEADER = 'wl-cmd'
 
@@ -98,7 +99,7 @@ class AMQStompConnector(object):
         self.subscriptions = []
 
     def connect(self):
-        self.cid = '%s.%s.%s' % (socket.gethostname(), os.getpid(), random.randrange(200))
+        #self.cid = '%s.%s.%s' % (socket.gethostname(), os.getpid(), random.randrange(200))
         logger.debug("Connecting %s" % self.cid)
         try:
             self.connection.start()
@@ -139,7 +140,9 @@ class AMQStompConnector(object):
         
     def send(self, destination, message, headers = None, ack = 'client'):
         try:
-            self.connection.send(message=self.encoder.encode(message), headers=headers or {}, 
+            headers = headers or {}
+            headers['id'] = self.cid
+            self.connection.send(message=self.encoder.encode(message), headers=headers, 
                                  destination=destination, ack=ack)
         except stomp.exception.NotConnectedException, ex:
             trace = sys.exc_info()[2]
@@ -193,6 +196,7 @@ class AMQStompConnector(object):
                         logger.debug('header: key %s , value %s' %(k,v))
                     logger.debug('body: %s'% message)
 
+                logger.debug("Firing event: %s" % str(event))
                 if 'buffersize' in headers:
                     for m in pickle.loads(message):
                         self.dispatcher.fire(event(headers=headers, message=m))
@@ -220,7 +224,6 @@ class BaseConsumer(object):
 
     def __init__(self, connector, destination, params, ackmode):
         self.connector = connector
-        self.cid = '%s.%s.%s' % (socket.gethostname(), os.getpid(), random.randrange(200))
         self.can_run = False
         self.connector.add_listener(self)
         self.subscriptionparams = (destination, params, ackmode)
@@ -230,7 +233,6 @@ class BaseConsumer(object):
         self.connector.connect()
         self.can_run = self.connector.is_connected()
         dest, params, ackmode = self.subscriptionparams
-        params['id'] = self.cid
         self.connector.subscribe(destination=dest, params=params, ack=ackmode)
         return True
 
@@ -345,7 +347,7 @@ class StatsConsumer(BaseConsumer):
                 self.lastobserv = {'time':self.time, 'received':self.received}
 
         def getdata(self):
-            return {'id': self.owner.cid,
+            return {'id': self.owner.connector.cid,
                     'received':self.received,
                     'time': self.time,
                     'status': 'idle' if time.time() - self.time > self.idledelay else 'working',
@@ -418,7 +420,7 @@ class Consumer(StatsConsumer):
 
     @handle_events(MessageEvent)
     def on_message_event(self, event):
-        logger.debug("CID %s:Received message: %s" % (self.cid, event))
+        logger.debug("CID %s:Received message: %s" % (self.connector.cid, event))
         try:
             self.processor(event.headers, event.message)
         except Exception as ex:
@@ -446,7 +448,7 @@ class Consumer(StatsConsumer):
         @handle_events(PingEvent)
         def on_ping_event(self, event):
             logger.debug("received ping request: %s" % event)
-            self.connector.send(message={'pong':self.owner.cid}, headers={'correlation-id':event.headers['correlation-id'], 
+            self.connector.send(message={'pong':self.connector.cid}, headers={'correlation-id':event.headers['correlation-id'], 
                                                                           COMMAND_HEADER:'PingEvent'},
                       destination=event.headers['reply-to'], ack='auto')
 
@@ -470,14 +472,14 @@ class ConsumerClient(object):
     def __init__(self, connector, commandtopic):
         self.connector = connector
         self.commandtopic = commandtopic
-        self.cid = hashlib.md5(str(time.time() * random.random())).hexdigest()
-        self.replyqueue = '/temp-queue/%s' % self.cid
+        self.cid = 'client-' + hashlib.md5(str(time.time() * random.random())).hexdigest()
+        self.replyqueue = '/temp-queue/%s' % self.connector.cid
         self.counter = 0
         self.resultholder = {}
 
     def connect(self):
-        self.connector.connect()
         self.connector.add_listener(self)
+        self.connector.connect()
         self.connector.subscribe(destination=self.replyqueue, ack='auto')
 
     def disconnect(self):
@@ -499,7 +501,7 @@ class ConsumerClient(object):
     def send_receive(self, cmdmsg, timeout, expectedcount):
         headers, message = cmdmsg
         cmd = headers[COMMAND_HEADER]
-        correlationid = '%s.%d' % (self.cid, self.counter)
+        correlationid = '%s.%d' % (self.connector.cid, self.counter)
         headers.update({'reply-to': self.replyqueue,
                         'correlation-id': correlationid,
                         'priority':127 })
@@ -531,10 +533,12 @@ class ConsumerClient(object):
             traceback.print_exc()
             return []
 
-    def on_message(self, headers, message):
+    @handle_events(MessageEvent,PingEvent,StatsEvent)
+    def on_message(self, event):
+        headers, message = event.headers, event.message
         if logger.isEnabledFor(logging.DEBUG):
-            logger.debug("Client %s Received response from: %s - %s" % (self.cid, str(message), headers['id']))
-        logger.debug("Client %s Received response from: %s - %s" % (self.cid, str(message), headers['id']))
+            logger.debug("Client %s Received response from: %s - %s" % (self.connector.cid, str(message), headers['id']))
+        logger.info("Client %s Received response from: %s - %s" % (self.connector.cid, str(message), headers['id']))
 
         cmd = headers[COMMAND_HEADER]
         correlationid = headers['correlation-id']
@@ -626,7 +630,7 @@ class AMQClientFactory:
     def createConsumerClient(self, commandtopic = None):
         if not commandtopic and not 'commandtopic' in self.params:
             raise NameError("Cannot create consumer monitor. No command queue set! Please set the commandtopic argument or call setCommandTopic before")
-        cid = '%s.%s.%s' % (socket.gethostname(), os.getpid(), random.randrange(200))
+        cid = 'client-%s.%s.%s' % (socket.gethostname(), os.getpid(), random.randrange(200))
         obj = ConsumerClient(AMQStompConnector(cid, self.params['amqparams']), commandtopic or self.params['commandtopic'])
         self.references[id(obj)] = obj
         return obj
@@ -634,7 +638,7 @@ class AMQClientFactory:
     def createProducer(self, messagequeue = None, defaultheaders = None):
         if not messagequeue and not 'messagequeue' in self.params:
             raise NameError("Cannot create producer. No message queue set! Please set the messagequeue argument or call setMessageQueue before")
-        cid = '%s.%s.%s' % (socket.gethostname(), os.getpid(), random.randrange(200))
+        cid = 'producer-%s.%s.%s' % (socket.gethostname(), os.getpid(), random.randrange(200))
         obj = Producer(AMQStompConnector(cid, self.params['amqparams']), messagequeue or self.params['messagequeue'], defaultheaders)
         self.references[id(obj)] = obj
         return obj
@@ -642,7 +646,7 @@ class AMQClientFactory:
     def createBufferedProducer(self, buffersize, messagequeue = None, defaultheaders = None):
         if not messagequeue and not 'messagequeue' in self.params:
             raise NameError("Cannot create producer. No message queue set! Please set the messagequeue argument or call setMessageQueue before")
-        cid = '%s.%s.%s' % (socket.gethostname(), os.getpid(), random.randrange(200))
+        cid = 'producer-%s.%s.%s' % (socket.gethostname(), os.getpid(), random.randrange(200))
         obj = BufferedProducer(Producer(AMQStompConnector(cid, self.params['amqparams']), messagequeue or self.params['messagequeue'], defaultheaders), buffersize)
         self.references[id(obj)] = obj
         return obj
@@ -654,7 +658,7 @@ class AMQClientFactory:
         if not commandtopic and not 'commandtopic' in self.params:
             raise NameError("Cannot create consumer. No command queue set! Please set the commandtopic argument or call setCommandTopic before")
 
-        cid = '%s.%s.%s' % (socket.gethostname(), os.getpid(), random.randrange(200))
+        cid = 'consumer-%s.%s.%s' % (socket.gethostname(), os.getpid(), random.randrange(200))
         obj = Consumer(AMQStompConnector(cid, self.params['amqparams']), AMQStompConnector(cid, self.params['amqparams']),
                        acallable, 
                        (messagequeue or self.params['messagequeue'], {'activemq.priority':0, 'activemq.prefetchSize':1}, 'client'), 
@@ -666,7 +670,7 @@ class AMQClientFactory:
     def spawnConsumers(self, f, consumercount):
         def startConsumer(c, i):
             def _startConsumer():
-                logging.config.fileConfig(os.path.join('etc', 'logging.conf'))
+                #logging.config.fileConfig(os.path.join('etc', 'logging.conf'))
                 global logger
                 logger = logging.getLogger()
                 logger.debug("Creating consumer %d" % i)

@@ -64,7 +64,6 @@ class TestPipelineProcessor(unittest.TestCase):
             raise SystemExit()
         self.assertEqual(reduce(lambda tot, stat: tot + stat['received'], self.monitor.stats(), 0), expectedmessage + 20)
 
-
     def testZStopConsumers(self):
         print "Stopping consumer"
         self.monitor.stopConsumers()
@@ -76,10 +75,6 @@ class TestPipelineProcessor(unittest.TestCase):
 
         self.assertEqual(len(self.monitor.ping()),  0)
         
-    def testProcessing(self):
-        #process = self.factory.spawnConsumers(
-        pass
-
     def tearDown(self):
         self.factory.disconnectAll()
 
