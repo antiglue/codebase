@@ -665,7 +665,7 @@ class AMQClientFactory:
     def spawnConsumers(self, f, consumercount):
         def startConsumer(c, i):
             def _startConsumer():
-                #logging.config.fileConfig(os.path.join('etc', 'logging.conf'))
+                logging.config.fileConfig(os.path.join('etc', 'logging.conf'))
                 global logger
                 logger = logging.getLogger()
                 logger.debug("Creating consumer %d" % i)
