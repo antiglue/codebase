@@ -13,6 +13,7 @@ import threading
 import time
 import traceback
 import weakref
+import json
 from pprint import pprint as pp
 from pprint import pformat as pf
 from events import EventDispatcher, Event, handle_events
@@ -71,17 +72,30 @@ class PingEvent(Event):
     """
     pass
 
-       
-class AMQClient(object):
+class JSONEncoder(object):
+    def encode(self, data):
+        return json.dumps(data)
+
+    def decode(self, data):
+        return json.loads(data)
+
+COMMAND_HEADER = 'wl-cmd'
+
+class AMQStompConnector(object):
     """
-    An AMQClient handles basic stomp operations such as connect, send and disconnect.
+    An AMQStompConnector handles basic stomp operations such as connect, send and disconnect.
     "with" statement is supported
     """
 
-    def __init__(self, amqparams):
+    COMMAND_HEADER = 'wl-cmd'
+
+    def __init__(self, cid, amqparams):
+        self.cid = cid
         self.connection = stomp.Connection(**amqparams)
+        self.encoder = JSONEncoder()
+        self.listener = AMQStompConnector.AMQListener(self.connection, self.encoder)
+        self.connection.set_listener(self.cid, self.listener)
         self.subscriptions = []
-        self.cid = '%s.%s.%s' % (socket.gethostname(), os.getpid(), random.randrange(200))
 
     def connect(self):
         self.cid = '%s.%s.%s' % (socket.gethostname(), os.getpid(), random.randrange(200))
@@ -95,22 +109,27 @@ class AMQClient(object):
             trace = sys.exc_info()[2]
             raise ConnectionError('Connection failed!'), None, trace
 
-    def isconnected(self):
+    def is_connected(self):
         return self.connection and self.connection.is_connected()
 
     def disconnect(self):
-        if self.isconnected():
+        if self.is_connected():
             if self.subscriptions:
                 for subscr in self.subscriptions:
                     self.unsubscribe(subscr)
 
             self.connection.disconnect()
 
+    def ack(self, headers = None):
+        self.connection.ack(headers=headers or {})
+
+    def add_listener(self, listener):
+        self.listener.attach_listener(listener)
+
     def subscribe(self, destination, params = None, ack = 'client'):
         logger.debug("Subscribing to %s" % destination)
         self.subscriptions.append(destination)
-        params = params or {}
-        params['id'] = self.cid
+        params = params or {'id': self.cid}
         self.connection.subscribe(params, destination=destination, ack=ack)
 
     def unsubscribe(self, destination):
@@ -120,10 +139,7 @@ class AMQClient(object):
         
     def send(self, destination, message, headers = None, ack = 'client'):
         try:
-            headers = headers or {}
-            if not 'id' in headers:
-                headers['id'] = self.cid
-            self.connection.send(message=message, headers=headers, 
+            self.connection.send(message=self.encoder.encode(message), headers=headers or {}, 
                                  destination=destination, ack=ack)
         except stomp.exception.NotConnectedException, ex:
             trace = sys.exc_info()[2]
@@ -139,67 +155,15 @@ class AMQClient(object):
     def __del__(self):
         self.disconnect()
 
-class ErrorStrategies:
-    ERROR_SILENTLY = 2
-    ERROR_LOG = 2<<1
-    ERROR_DLQ = 2<<2
-    ERROR_STOP = 2<<3
-    ERROR_FAIL = 2<<4
-    ERROR_USER_FUNCT = 2<<5
-
-
-class BaseConsumer(AMQClient):
-    """
-    A basic Consumer class that listen for incoming message on a destination. 
-    Received messages are dispatched to methods as events
-    """
-    COMMAND_HEADER = 'wl-cmd'
-    SLEEP_EXIT = 0.1
-
-    def __init__(self, amqparams, destination, params, ackmode):
-        AMQClient.__init__(self, amqparams)
-        self.can_run = False
-        self.listener = BaseConsumer.AMQListener(self.connection)
-        self.listener.attach_listener(self)
-        self.connection.set_listener(self.cid, self.listener)
-        self.subscriptionparams = (destination, params, ackmode)
-        self.ackneeded = ackmode == 'client'
-
-    def connect(self):
-        AMQClient.connect(self)
-        self.can_run = self.connection.is_connected()
-        dest, params, ackmode = self.subscriptionparams
-        self.subscribe(destination=dest, params=params, ack=ackmode)
-        return True
-
-    def disconnect(self):
-        AMQClient.disconnect(self)
-        self.can_run = False
-
-    def ack(self, headers = None):
-        self.connection.ack(headers=headers or {})
-
-    def run(self):
-        while self.can_run:
-            try: 
-                time.sleep(BaseConsumer.SLEEP_EXIT)
-            except KeyboardInterrupt:
-                self.disconnect()
-                raise SystemExit()
-
-    @handle_events(MessageProcessedEvent)
-    def on_message_processed(self, event):
-        if self.ackneeded:
-            self.ack(event.headers)
-
     class AMQListener(stomp.ConnectionListener):
         """
         Stomp bridging layer: fires received messages as events
         """
 
         DEBUG_MESSAGE = False
-        def __init__(self, connection):
+        def __init__(self, connection, encoder):
             self.connection = connection
+            self.encoder = encoder
             self.dispatcher = EventDispatcher()
             self.messagelock = threading.Lock()
         
@@ -214,12 +178,13 @@ class BaseConsumer(AMQClient):
             logger.debug("RECEIPT %s %s" % (headers, message))
 
         def on_message(self, headers, message):
+            message = self.encoder.decode(message)
             logger.debug("Received: %s" % str((headers, message)))
             with self.messagelock:
                 event = MessageEvent
-                if BaseConsumer.COMMAND_HEADER in headers:
+                if COMMAND_HEADER in headers:
                     logger.debug('Got %s COMMAND' % message)
-                    event = globals().get(headers[Consumer.COMMAND_HEADER], None)
+                    event = globals().get(headers[COMMAND_HEADER], None)
                     assert event
 
                 if self.DEBUG_MESSAGE and logger.isEnabledFor(logging.DEBUG):
@@ -236,6 +201,65 @@ class BaseConsumer(AMQClient):
 
                 self.dispatcher.fire(MessageProcessedEvent(headers=headers, message=message))
 
+
+class ErrorStrategies:
+    ERROR_SILENTLY = 2
+    ERROR_LOG = 2<<1
+    ERROR_DLQ = 2<<2
+    ERROR_STOP = 2<<3
+    ERROR_FAIL = 2<<4
+    ERROR_USER_FUNCT = 2<<5
+
+
+class BaseConsumer(object):
+    """
+    A basic Consumer class that listen for incoming message on a destination. 
+    Received messages are dispatched to methods as events
+    """
+    SLEEP_EXIT = 0.1
+
+    def __init__(self, connector, destination, params, ackmode):
+        self.connector = connector
+        self.cid = '%s.%s.%s' % (socket.gethostname(), os.getpid(), random.randrange(200))
+        self.can_run = False
+        self.connector.add_listener(self)
+        self.subscriptionparams = (destination, params, ackmode)
+        self.ackneeded = ackmode == 'client'
+
+    def connect(self):
+        self.connector.connect()
+        self.can_run = self.connector.is_connected()
+        dest, params, ackmode = self.subscriptionparams
+        params['id'] = self.cid
+        self.connector.subscribe(destination=dest, params=params, ack=ackmode)
+        return True
+
+    def disconnect(self):
+        self.connector.disconnect()
+        self.can_run = False
+
+    def ack(self, headers = None):
+        self.connector.ack(headers=headers or {})
+
+    def run(self):
+        while self.can_run:
+            try: 
+                time.sleep(BaseConsumer.SLEEP_EXIT)
+            except KeyboardInterrupt:
+                self.disconnect()
+                raise SystemExit()
+
+    @handle_events(MessageProcessedEvent)
+    def on_message_processed(self, event):
+        if self.ackneeded:
+            self.ack(event.headers)
+
+    def __enter__(self):
+        self.connect()
+        return self
+
+    def __exit__(self, type, value, tb):
+        self.disconnect()
 
     class ErrorStrategy(object):
         def __init__(self, owner):
@@ -295,10 +319,10 @@ class StatsConsumer(BaseConsumer):
     Statistics are calculated intercepting incoming messages.
     """
 
-    def __init__(self, amqparams, destination, params, ackmode):
-        BaseConsumer.__init__(self, amqparams, destination, params, ackmode)
+    def __init__(self, connector, destination, params, ackmode):
+        BaseConsumer.__init__(self, connector, destination, params, ackmode)
         self.stats = Consumer.StatsDelegate(self)
-        self.listener.attach_listener(self.stats)
+        self.connector.add_listener(self.stats)
 
     class StatsDelegate(object):
         def __init__(self, owner):
@@ -360,10 +384,10 @@ class Consumer(StatsConsumer):
     The consumer process will terminate if a stop command is received. 
     """ 
 
-    def __init__(self, amqparams, processor, subscriptionparams, commandtopicparams):
-        StatsConsumer.__init__(self, amqparams, *subscriptionparams)
+    def __init__(self, connector, controllerconnector, processor, subscriptionparams, commandtopicparams):
+        StatsConsumer.__init__(self, connector, *subscriptionparams)
         self.processor = processor
-        self.controller = Consumer.ControllerDelegate(self, amqparams, (commandtopicparams[0], commandtopicparams[1], 'auto'))
+        self.controller = Consumer.ControllerDelegate(self, controllerconnector, (commandtopicparams[0], commandtopicparams[1], 'auto'))
         self.controllerthread = threading.Thread(target=self.start_controller)
 
     def start_controller(self):
@@ -382,15 +406,15 @@ class Consumer(StatsConsumer):
 
     @staticmethod
     def pingmessage():
-        return ({BaseConsumer.COMMAND_HEADER:'PingEvent'},'ping')
+        return ({COMMAND_HEADER:'PingEvent'},'ping')
 
     @staticmethod
     def stopmessage():
-        return ({BaseConsumer.COMMAND_HEADER:'StopWorkerEvent'},'stop')
+        return ({COMMAND_HEADER:'StopWorkerEvent'},'stop')
 
     @staticmethod
     def statsmessage():
-        return ({BaseConsumer.COMMAND_HEADER:'StatsEvent'},'stats')
+        return ({COMMAND_HEADER:'StatsEvent'},'stats')
 
     @handle_events(MessageEvent)
     def on_message_event(self, event):
@@ -402,8 +426,8 @@ class Consumer(StatsConsumer):
             logger.exception(ex)
 
     class ControllerDelegate(BaseConsumer):
-        def __init__(self, owner, amqparams, subscriptionparams):
-            BaseConsumer.__init__(self, amqparams, *subscriptionparams)
+        def __init__(self, owner, connector, subscriptionparams):
+            BaseConsumer.__init__(self, connector, *subscriptionparams)
             self.owner = owner
 
         @handle_events(AmqErrorEvent)
@@ -414,15 +438,16 @@ class Consumer(StatsConsumer):
         @handle_events(StatsEvent)
         def on_stats_event(self, event):
             logger.debug("received stats request: %s" % event)
-            self.send(message=pickle.dumps(self.owner.stats.getdata()), headers={'correlation-id':event.headers['correlation-id'], 
-                                                                                 self.COMMAND_HEADER:'StatsEvent'},
-                      destination=event.headers['reply-to'], ack='auto')
+            self.connector.send(message=self.owner.stats.getdata(), 
+                                headers={'correlation-id':event.headers['correlation-id'], 
+                                         COMMAND_HEADER:'StatsEvent'},
+                                destination=event.headers['reply-to'], ack='auto')
 
         @handle_events(PingEvent)
         def on_ping_event(self, event):
             logger.debug("received ping request: %s" % event)
-            self.send(message=pickle.dumps({'pong':self.owner.cid}), headers={'correlation-id':event.headers['correlation-id'], 
-                                                                         self.COMMAND_HEADER:'PingEvent'},
+            self.connector.send(message={'pong':self.owner.cid}, headers={'correlation-id':event.headers['correlation-id'], 
+                                                                          COMMAND_HEADER:'PingEvent'},
                       destination=event.headers['reply-to'], ack='auto')
 
         @handle_events(StopWorkerEvent)
@@ -431,7 +456,7 @@ class Consumer(StatsConsumer):
             self.disconnect()
             self.owner.disconnect()
 
-class ConsumerClient(AMQClient):
+class ConsumerClient(object):
     """
     A ConsumerClient is responsible for communicating with Consumer via command topic.
     It is able to:
@@ -442,8 +467,8 @@ class ConsumerClient(AMQClient):
     """
 
     DEFAULT_TIMEOUT = 3
-    def __init__(self, amqparams, commandtopic):
-        AMQClient.__init__(self, amqparams)
+    def __init__(self, connector, commandtopic):
+        self.connector = connector
         self.commandtopic = commandtopic
         self.cid = hashlib.md5(str(time.time() * random.random())).hexdigest()
         self.replyqueue = '/temp-queue/%s' % self.cid
@@ -451,18 +476,18 @@ class ConsumerClient(AMQClient):
         self.resultholder = {}
 
     def connect(self):
-        AMQClient.connect(self)
-        self.connection.set_listener(self.cid, self)
-        self.connection.subscribe(destination=self.replyqueue, ack='auto')
+        self.connector.connect()
+        self.connector.add_listener(self)
+        self.connector.subscribe(destination=self.replyqueue, ack='auto')
 
     def disconnect(self):
-        if self.connection.is_connected():
-            self.connection.unsubscribe(destination=self.replyqueue)
-        AMQClient.disconnect(self)
+        if self.connector.is_connected():
+            self.connector.unsubscribe(destination=self.replyqueue)
+        self.connector.disconnect()
 
     def stopConsumers(self):
         headers, message = Consumer.stopmessage()
-        self.send(message=message, headers=headers,
+        self.connector.send(message=message, headers=headers,
                   destination=self.commandtopic, ack='auto')
 
     def ping(self, timeout = DEFAULT_TIMEOUT, expectedcount = -1):
@@ -473,7 +498,7 @@ class ConsumerClient(AMQClient):
 
     def send_receive(self, cmdmsg, timeout, expectedcount):
         headers, message = cmdmsg
-        cmd = headers[BaseConsumer.COMMAND_HEADER]
+        cmd = headers[COMMAND_HEADER]
         correlationid = '%s.%d' % (self.cid, self.counter)
         headers.update({'reply-to': self.replyqueue,
                         'correlation-id': correlationid,
@@ -481,7 +506,7 @@ class ConsumerClient(AMQClient):
         self.resultholder.setdefault(cmd,{})[correlationid] = []
         logger.debug("Sending %s request to: %s" % (cmd, self.commandtopic))
         try:
-            self.send(message=message, headers=headers,
+            self.connector.send(message=message, headers=headers,
                       destination=self.commandtopic, ack='auto')
             self.counter += 1
             if expectedcount > 0:
@@ -507,27 +532,39 @@ class ConsumerClient(AMQClient):
             return []
 
     def on_message(self, headers, message):
-        data = pickle.loads(message)
         if logger.isEnabledFor(logging.DEBUG):
-            logger.debug("Client %s Received response from: %s - %s" % (self.cid, str(data), headers['id']))
+            logger.debug("Client %s Received response from: %s - %s" % (self.cid, str(message), headers['id']))
 
-        cmd = headers[Consumer.COMMAND_HEADER]
+        cmd = headers[COMMAND_HEADER]
         correlationid = headers['correlation-id']
         if cmd in self.resultholder and correlationid in self.resultholder[cmd]:
-            self.resultholder[cmd][correlationid].append(data)
+            self.resultholder[cmd][correlationid].append(message)
 
    
-class Producer(AMQClient):
-    def __init__(self, amqparams, destination, defaultheaders = None):
-        AMQClient.__init__(self, amqparams)
-        self.defaultheaders = defaultheaders or {}
+class Producer(object):
+    def __init__(self, connector, destination, defaultheaders = None):
+        self.connector = connector
+        self.defaultheaders = defaultheaders or {'persistent':'true'}
         self.destination = destination
+
+    def connect(self):
+        self.connector.connect()
+
+    def disconnect(self):
+        self.connector.disconnect()
+  
+    def __enter__(self):
+        self.connect()
+        return self
+
+    def __exit__(self, type, value, tb):
+        self.disconnect()
 
     def sendMessage(self, message, headers = None):
         hs = dict( self.defaultheaders.items() + 
                    (headers or {}).items() )
-        self.send(message=message, headers=hs,
-                  destination=self.destination, ack='client')
+        self.connector.send(message=message, headers=hs,
+                            destination=self.destination, ack='client')
 
 class DynamicProxy(object):
     def __init__(self, target):
@@ -588,21 +625,24 @@ class AMQClientFactory:
     def createConsumerClient(self, commandtopic = None):
         if not commandtopic and not 'commandtopic' in self.params:
             raise NameError("Cannot create consumer monitor. No command queue set! Please set the commandtopic argument or call setCommandTopic before")
-        obj = ConsumerClient(self.params['amqparams'], commandtopic or self.params['commandtopic'])
+        cid = '%s.%s.%s' % (socket.gethostname(), os.getpid(), random.randrange(200))
+        obj = ConsumerClient(AMQStompConnector(cid, self.params['amqparams']), commandtopic or self.params['commandtopic'])
         self.references[id(obj)] = obj
         return obj
 
     def createProducer(self, messagequeue = None, defaultheaders = None):
         if not messagequeue and not 'messagequeue' in self.params:
             raise NameError("Cannot create producer. No message queue set! Please set the messagequeue argument or call setMessageQueue before")
-        obj = Producer(self.params['amqparams'], messagequeue or self.params['messagequeue'], defaultheaders)
+        cid = '%s.%s.%s' % (socket.gethostname(), os.getpid(), random.randrange(200))
+        obj = Producer(AMQStompConnector(cid, self.params['amqparams']), messagequeue or self.params['messagequeue'], defaultheaders)
         self.references[id(obj)] = obj
         return obj
 
     def createBufferedProducer(self, buffersize, messagequeue = None, defaultheaders = None):
         if not messagequeue and not 'messagequeue' in self.params:
             raise NameError("Cannot create producer. No message queue set! Please set the messagequeue argument or call setMessageQueue before")
-        obj = BufferedProducer(Producer(self.params['amqparams'], messagequeue or self.params['messagequeue'], defaultheaders), buffersize)
+        cid = '%s.%s.%s' % (socket.gethostname(), os.getpid(), random.randrange(200))
+        obj = BufferedProducer(Producer(AMQStompConnector(cid, self.params['amqparams']), messagequeue or self.params['messagequeue'], defaultheaders), buffersize)
         self.references[id(obj)] = obj
         return obj
 
@@ -613,7 +653,8 @@ class AMQClientFactory:
         if not commandtopic and not 'commandtopic' in self.params:
             raise NameError("Cannot create consumer. No command queue set! Please set the commandtopic argument or call setCommandTopic before")
 
-        obj = Consumer(self.params['amqparams'], 
+        cid = '%s.%s.%s' % (socket.gethostname(), os.getpid(), random.randrange(200))
+        obj = Consumer(AMQStompConnector(cid, self.params['amqparams']), AMQStompConnector(cid, self.params['amqparams']),
                        acallable, 
                        (messagequeue or self.params['messagequeue'], {'activemq.priority':0, 'activemq.prefetchSize':1}, 'client'), 
                        (commandtopic or self.params['commandtopic'], {'activemq.priority':10}, 'auto')
@@ -624,7 +665,7 @@ class AMQClientFactory:
     def spawnConsumers(self, f, consumercount):
         def startConsumer(c, i):
             def _startConsumer():
-                logging.config.fileConfig(os.path.join('etc', 'logging.conf'))
+                #logging.config.fileConfig(os.path.join('etc', 'logging.conf'))
                 global logger
                 logger = logging.getLogger()
                 logger.debug("Creating consumer %d" % i)
@@ -655,7 +696,7 @@ def main():
     # funzione da eseguire per ogni messaggio
     def f(h,m):
         logger.info("Processor::MessageEvent: %s - %s" % (str(h),str(m)))
-        time.sleep(2)
+        #time.sleep(2)
 
     # istanzio la factory dei producer/consumer e setto i parametri
     amqfactory = AMQClientFactory(amqparams)

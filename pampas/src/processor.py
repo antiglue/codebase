@@ -1,5 +1,10 @@
 # to be moved
 from pipeline import Document, DocumentPipeline, ProcessorStatus, StageError
+import json
+import logging
+
+logger = logging.getLogger()
+
 class PipelineProcessor:
     """
     A PipelineProcessor forwards incoming messages to a pipeline of stages
@@ -10,9 +15,10 @@ class PipelineProcessor:
         self.pipeline.init(pipelineconfigdir)
 
     def makeDocument(self, header, message):
+        message = json.loads(message)
         if isinstance(message, dict):
             doc = Document(message)
-            dpc.Set('amqheaders', header)
+            doc.Set('amqheaders', header)
         elif isinstance(message, str):
             doc = Document(header)
             doc.Set('body', message)

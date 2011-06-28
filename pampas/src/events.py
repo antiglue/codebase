@@ -1,5 +1,6 @@
 
 from functools import wraps, partial
+import traceback
 
 class EventDispatcher(object):
     """
