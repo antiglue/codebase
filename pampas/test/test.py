@@ -34,6 +34,14 @@ class TestPipelineProcessor(unittest.TestCase):
         print "Process spawned. Testing..."
         self.assertEqual(len(self.monitor.ping()), 3)
 
+    def testEncoder(self):
+        data = {'1':1,'2':2}
+        je = JSONEncoder()
+        encoded = je.encode(data)
+        dec = je.decode(encoded)
+        self.assertTrue(isinstance(dec, dict))
+        self.assertEqual(data, dec)
+
     def testProducer(self):
         expectedmessage = 20
         print "Sending test messages..."

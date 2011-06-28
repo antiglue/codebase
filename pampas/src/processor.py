@@ -23,6 +23,7 @@ class PipelineProcessor:
             doc.Set('body', message)
         else:
             raise Exception("Not implemented")
+
         return doc
 
     def process(self, header, message):
