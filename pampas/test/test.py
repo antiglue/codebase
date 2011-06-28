@@ -4,6 +4,7 @@ import pampas
 import unittest
 import time
 import logging
+
 logging.basicConfig(level=logging.DEBUG, format="[%(asctime)s] %(module)15s:%(name)10s:%(lineno)4d [%(levelname)6s]:  %(message)s")
 
 def testf(headers, message):
@@ -23,7 +24,6 @@ class TestPipelineProcessor(unittest.TestCase):
 
     def testASpawnProcess(self):
         print "Spawning 3 workers"
-        #procs = self.factory.spawnConsumers(self.proc, 3)
         self.procs = self.factory.spawnConsumers(testf, 3)
         try:
             time.sleep(3)
@@ -33,7 +33,6 @@ class TestPipelineProcessor(unittest.TestCase):
 
         print "Process spawned. Testing..."
         self.assertEqual(len(self.monitor.ping()), 3)
-       
 
     def testProducer(self):
         expectedmessage = 20
