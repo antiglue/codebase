@@ -15,7 +15,6 @@ class PipelineProcessor:
         self.pipeline.init(pipelineconfigdir)
 
     def makeDocument(self, header, message):
-        message = json.loads(message)
         if isinstance(message, dict):
             doc = Document(message)
             doc.Set('amqheaders', header)
