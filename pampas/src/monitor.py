@@ -1,7 +1,7 @@
 
 
 
-from workerlib import AMQClientFactory
+from pampas import AMQClientFactory
 import time
 
 # parametri di connessione ad ActiveMQ

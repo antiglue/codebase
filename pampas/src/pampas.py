@@ -73,12 +73,23 @@ class PingEvent(Event):
     """
     pass
 
+class DummyEncoder(object):
+    def encode(self, data):
+        return data
+
+    def decode(self, data):
+        return data
+
 class JSONEncoder(object):
     def encode(self, data):
         return base64.b64encode(json.dumps(data))
 
     def decode(self, data):
-        return json.loads(base64.b64decode(data))
+        try:
+            return json.loads(base64.b64decode(data))
+        except TypeError, e:
+            logger.warning("Message decoding error: %s" % str(e))
+            logger.exception(e)
 
 COMMAND_HEADER = 'wl-cmd'
 
@@ -90,10 +101,10 @@ class AMQStompConnector(object):
 
     COMMAND_HEADER = 'wl-cmd'
 
-    def __init__(self, cid, amqparams):
+    def __init__(self, cid, amqparams, encoder):
         self.cid = cid
         self.connection = stomp.Connection(**amqparams)
-        self.encoder = JSONEncoder()
+        self.encoder = encoder
         self.listener = AMQStompConnector.AMQListener(self.connection, self.encoder)
         self.connection.set_listener(self.cid, self.listener)
         self.subscriptions = []
@@ -205,7 +216,6 @@ class AMQStompConnector(object):
 
                 self.dispatcher.fire(MessageProcessedEvent(headers=headers, message=message))
 
-
 class ErrorStrategies:
     ERROR_SILENTLY = 2
     ERROR_LOG = 2<<1
@@ -213,7 +223,6 @@ class ErrorStrategies:
     ERROR_STOP = 2<<3
     ERROR_FAIL = 2<<4
     ERROR_USER_FUNCT = 2<<5
-
 
 class BaseConsumer(object):
     """
@@ -498,6 +507,13 @@ class ConsumerClient(object):
     def stats(self, timeout = DEFAULT_TIMEOUT, expectedcount = -1):
         return self.send_receive(Consumer.statsmessage(), timeout, expectedcount)
 
+    def __enter__(self):
+        self.connect()
+        return self
+
+    def __exit__(self, type, value, tb):
+        self.disconnect()
+
     def send_receive(self, cmdmsg, timeout, expectedcount):
         headers, message = cmdmsg
         cmd = headers[COMMAND_HEADER]
@@ -518,7 +534,6 @@ class ConsumerClient(object):
                         timeout -= 1
                     except KeyboardInterrupt:
                         raise SystemExit()
-
             else:
                 try:
                     time.sleep(timeout)
@@ -535,6 +550,7 @@ class ConsumerClient(object):
 
     @handle_events(MessageEvent,PingEvent,StatsEvent)
     def on_message(self, event):
+        print event, event.headers, event.message
         headers, message = event.headers, event.message
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("Client %s Received response from: %s - %s" % (self.connector.cid, str(message), headers['id']))
@@ -557,7 +573,7 @@ class Producer(object):
 
     def disconnect(self):
         self.connector.disconnect()
-  
+
     def __enter__(self):
         self.connect()
         return self
@@ -613,16 +629,21 @@ class AMQClientFactory:
     A AMQClientFactory should be used to inizialize amq clients
     """
 
-    def __init__(self, amqparams):
+    def __init__(self, amqparams, encoder = JSONEncoder()):
         self.params = {}
-        self.params['amqparams'] = amqparams
+        self.params['amqparams'] = {'reconnect_attempts_max': 5,
+                                    'reconnect_sleep_initial': 1,
+                                    'reconnect_sleep_jitter':3,
+                                    'reconnect_sleep_max': 300,
+                                    'try_loopback_connect': False}
+        self.params['amqparams'].update(amqparams)
+        self.encoder = encoder
         self.references = weakref.WeakValueDictionary()
 
     def setMessageQueue(self, messagequeue):
         self.params['messagequeue'] = messagequeue
         if 'commandtopic' not in self.params:
             self.params['commandtopic'] = '/topic/%s_cmd' % messagequeue.split('/').pop()
-            print self.params['commandtopic']
 
     def setCommandTopic(self, commandtopic):
         self.params['commandtopic'] = commandtopic
@@ -631,7 +652,7 @@ class AMQClientFactory:
         if not commandtopic and not 'commandtopic' in self.params:
             raise NameError("Cannot create consumer monitor. No command queue set! Please set the commandtopic argument or call setCommandTopic before")
         cid = 'client-%s.%s.%s' % (socket.gethostname(), os.getpid(), random.randrange(200))
-        obj = ConsumerClient(AMQStompConnector(cid, self.params['amqparams']), commandtopic or self.params['commandtopic'])
+        obj = ConsumerClient(AMQStompConnector(cid, self.params['amqparams'], self.encoder), commandtopic or self.params['commandtopic'])
         self.references[id(obj)] = obj
         return obj
 
@@ -639,7 +660,7 @@ class AMQClientFactory:
         if not messagequeue and not 'messagequeue' in self.params:
             raise NameError("Cannot create producer. No message queue set! Please set the messagequeue argument or call setMessageQueue before")
         cid = 'producer-%s.%s.%s' % (socket.gethostname(), os.getpid(), random.randrange(200))
-        obj = Producer(AMQStompConnector(cid, self.params['amqparams']), messagequeue or self.params['messagequeue'], defaultheaders)
+        obj = Producer(AMQStompConnector(cid, self.params['amqparams'], self.encoder), messagequeue or self.params['messagequeue'], defaultheaders)
         self.references[id(obj)] = obj
         return obj
 
@@ -647,7 +668,7 @@ class AMQClientFactory:
         if not messagequeue and not 'messagequeue' in self.params:
             raise NameError("Cannot create producer. No message queue set! Please set the messagequeue argument or call setMessageQueue before")
         cid = 'producer-%s.%s.%s' % (socket.gethostname(), os.getpid(), random.randrange(200))
-        obj = BufferedProducer(Producer(AMQStompConnector(cid, self.params['amqparams']), messagequeue or self.params['messagequeue'], defaultheaders), buffersize)
+        obj = BufferedProducer(Producer(AMQStompConnector(cid, self.params['amqparams'], self.encoder), messagequeue or self.params['messagequeue'], defaultheaders), buffersize)
         self.references[id(obj)] = obj
         return obj
 
@@ -659,7 +680,7 @@ class AMQClientFactory:
             raise NameError("Cannot create consumer. No command queue set! Please set the commandtopic argument or call setCommandTopic before")
 
         cid = 'consumer-%s.%s.%s' % (socket.gethostname(), os.getpid(), random.randrange(200))
-        obj = Consumer(AMQStompConnector(cid, self.params['amqparams']), AMQStompConnector(cid, self.params['amqparams']),
+        obj = Consumer(AMQStompConnector(cid, self.params['amqparams'], self.encoder), AMQStompConnector(cid, self.params['amqparams'], self.encoder),
                        acallable, 
                        (messagequeue or self.params['messagequeue'], {'activemq.priority':0, 'activemq.prefetchSize':1}, 'client'), 
                        (commandtopic or self.params['commandtopic'], {'activemq.priority':10}, 'auto')

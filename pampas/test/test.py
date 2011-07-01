@@ -36,7 +36,7 @@ class TestPipelineProcessor(unittest.TestCase):
 
     def testEncoder(self):
         data = {'1':1,'2':2}
-        je = JSONEncoder()
+        je = pampas.JSONEncoder()
         encoded = je.encode(data)
         dec = je.decode(encoded)
         self.assertTrue(isinstance(dec, dict))
@@ -55,6 +55,7 @@ class TestPipelineProcessor(unittest.TestCase):
         except KeyboardInterrupt:
             self.factory.disconnectAll()
             raise SystemExit()
+        print self.monitor.stats()
         self.assertEqual(reduce(lambda tot, stat: tot + stat['received'], self.monitor.stats(), 0), expectedmessage)
 
     def testProducerBatch(self):
