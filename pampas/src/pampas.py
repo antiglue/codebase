@@ -37,18 +37,6 @@ class ConnectionError(Error):
     """
     pass
 
-class AmqErrorEvent(Event):
-    """
-    A AmqErrorEvent is fired by AMQListener when it receives an error 
-    """
-    pass
-
-class StopWorkerEvent(Event):
-    """
-    A StopWorkerEvent is fired by AMQListener when it receives a stop command
-    """
-    pass
-
 class MessageEvent(Event):
     """
     A MessageEvent is fired by AMQListener when it receives a message to elaborate
@@ -61,6 +49,12 @@ class MessageProcessedEvent(Event):
     """
     pass
 
+class MessageProcessingErrorEvent(Event):
+    """
+    A MessageEvent is fired by AMQListener when message processing fails
+    """
+    pass
+
 class StatsEvent(Event):
     """
     A StatsEvent
@@ -70,6 +64,18 @@ class StatsEvent(Event):
 class PingEvent(Event):
     """
     A PingEvent
+    """
+    pass
+
+class AmqErrorEvent(Event):
+    """
+    A AmqErrorEvent is fired by AMQListener when it receives an error 
+    """
+    pass
+
+class StopWorkerEvent(Event):
+    """
+    A StopWorkerEvent is fired by AMQListener when it receives a stop command
     """
     pass
 
@@ -216,13 +222,85 @@ class AMQStompConnector(object):
 
                 self.dispatcher.fire(MessageProcessedEvent(headers=headers, message=message))
 
-class ErrorStrategies:
-    ERROR_SILENTLY = 2
-    ERROR_LOG = 2<<1
-    ERROR_DLQ = 2<<2
-    ERROR_STOP = 2<<3
-    ERROR_FAIL = 2<<4
-    ERROR_USER_FUNCT = 2<<5
+class ErrorStrategy(object):
+    """
+    An ErrorStrategy defines the chain of actions a consumer will run to handle errors
+    """
+    def __init__(self):
+        self.actionchain = {}
+
+    def append(self, eventType, action):
+        self.actionchain.setdefault(eventType, []).append(action)
+        return self
+
+    def __call__(self, event):
+        logger.debug("Received error: %s" % type(event))
+        try:
+            for action in self.actionchain.get(type(event), []):
+                action(event)
+        except:
+            traceback.print_exc() # error handler should not fail
+
+    def __repr__(self):
+        return 'ErrorStrategy - chain: %s' % '\n\t'.join(('on "%s": %s' % (k.__name__, '=>'.join([ v.__class__.__name__ for v in vs])) for k,vs in self.actionchain.items()))
+
+class ErrorLogStrategy(ErrorStrategy):
+    def __init__(self, level = logging.WARNING, logstacktrace = True, logfullmessage = False):
+        self.level = level
+        self.logfullmessage = logfullmessage
+        self.logstacktrace = logstacktrace
+
+    def __call__(self, event):
+        logger.log(self.level, '%s: "%s" => Message={headers:"%s", message="%s"}' % 
+                                (str(event.exc_cause.__class__.__name__), 
+                                 event.exc_description,
+                                 str(event.headers), 
+                                 str(event.message) if self.logfullmessage else '...'))
+        if self.logstacktrace:
+            logger.exception(event.exc_cause)
+
+class ErrorDLQStrategy(ErrorStrategy):
+    def __init__(self, destination, defaultheaders = None):
+        self.destination = destination
+        self.defaultheaders = defaultheaders or {}
+ 
+    def __call__(self, event):
+        headers = self.defaultheaders.copy()
+        headers.update({'errorType': str(event.exc_cause), 
+                        'errorDesc': event.exc_description})
+        headers.update(event.headers)
+        if 'destination' in headers:
+            del headers['destination']
+        event.owner.connector.send(message=event.message, headers=headers, 
+                                   destination=self.destination, ack='auto')
+
+class ErrorStopStrategy(ErrorStrategy):
+    def __call__(self, event):
+        self.owner.disconnect()
+
+class ErrorFailStrategy(ErrorStrategy):
+    def __call__(self, event):
+        raise event.exc_cause
+
+class ErrorUserFunctStrategy(ErrorStrategy):
+    def __init__(self, callback):
+        self.callback = callback
+
+    def __call__(self, event):
+        self.callback(event)
+
+try:
+    from nagiosLib.nagiosClass import writeNagiosException
+    class NagiosErrorStrategy(ErrorStrategy):
+        PROJECTNAME = 'pampas'
+        def __call__(self, event):
+            writeNagiosException(serviceName=self.PROJECTNAME, 
+                                 errorToWrite='%s - %s' % (str(event.exc_cause.__class__.__name__), event.exc_description))
+except:
+    class NagiosErrorStrategy(ErrorStrategy):
+        PROJECTNAME = 'pampas'
+        def __call__(self, event):
+            raise ImportError("nagiosLib unavailable")
 
 class BaseConsumer(object):
     """
@@ -231,12 +309,22 @@ class BaseConsumer(object):
     """
     SLEEP_EXIT = 0.1
 
-    def __init__(self, connector, destination, params, ackmode):
+    def __init__(self, connector, errorstrategy, destination, params, ackmode):
         self.connector = connector
         self.can_run = False
         self.connector.add_listener(self)
         self.subscriptionparams = (destination, params, ackmode)
         self.ackneeded = ackmode == 'client'
+        self.errorstrategy = errorstrategy
+
+    def set_error_strategy(self, errorstrategy):
+        self.errorstrategy = errorstrategy
+
+    def append_error_handler(self, strategy):
+        self.errorstrategy.append(MessageProcessingErrorEvent, strategy)
+
+    def handle_error(self, event):
+        self.errorstrategy(event)
 
     def connect(self):
         self.connector.connect()
@@ -272,66 +360,14 @@ class BaseConsumer(object):
     def __exit__(self, type, value, tb):
         self.disconnect()
 
-    class ErrorStrategy(object):
-        def __init__(self, owner):
-            self.owner = owner
-
-        def __call__(self, event):
-            pass
-
-    class ErrorLogStrategy(ErrorStrategy):
-        def __init__(self, owner, level = logging.WARNING, logstacktrace = True, logfullmessage = False):
-            ErrorStrategy.__init__(self, owner)
-            self.level = level
-            self.logfullmessage = logfullmessage
-            self.logstacktrace = logstacktrace
-
-        def __call__(self, event):
-            logger.log(self.level, '%s: "%s" - Message={headers:"%s", message="%s"}' % 
-                                    (event.exc_description,
-                                     str(event.exc_cause), 
-                                     str(event.headers), 
-                                     str(event.message) if self.logfullmessage else '...'))
-            if self.logstacktrace:
-                logger.exception(event.exc_cause)
-
-    class ErrorDLQStrategy(ErrorStrategy):
-        def __init__(self, owner, destination, params):
-            ErrorStrategy.__init__(self, owner)
-            self.destination = destination
-     
-        def __call__(self, event):
-            headers = {'errorType': str(event.exc_cause), 
-                       'errorDesc': event.exc_description}
-            headers.update(event.headers)
-            self.owner.send(message=event.message, headers=headers, 
-                            destination=self.destination, ack='auto')
-
-    class ErrorStopStrategy(ErrorStrategy):
-        def __call__(self, event):
-            self.owner.disconnect()
-
-    class ErrorFailStrategy(ErrorStrategy):
-        def __call__(self, event):
-            raise event.exc_cause
-
-    class ErrorUserFunctStrategy(ErrorStrategy):
-        def __init__(self, owner, callback):
-            ErrorStrategy.__init__(self, owner)
-            self.callback = callback
-
-        def __call__(self, event):
-            self.callback(event)
-
-
 class StatsConsumer(BaseConsumer):
     """
     A StatsConsumer adds statistics and performance data to BaseCosumer.
     Statistics are calculated intercepting incoming messages.
     """
 
-    def __init__(self, connector, destination, params, ackmode):
-        BaseConsumer.__init__(self, connector, destination, params, ackmode)
+    def __init__(self, connector, errorstrategy,  destination, params, ackmode):
+        BaseConsumer.__init__(self, connector, errorstrategy, destination, params, ackmode)
         self.stats = Consumer.StatsDelegate(self)
         self.connector.add_listener(self.stats)
 
@@ -395,8 +431,8 @@ class Consumer(StatsConsumer):
     The consumer process will terminate if a stop command is received. 
     """ 
 
-    def __init__(self, connector, controllerconnector, processor, subscriptionparams, commandtopicparams):
-        StatsConsumer.__init__(self, connector, *subscriptionparams)
+    def __init__(self, connector, controllerconnector, errorstrategy, processor, subscriptionparams, commandtopicparams):
+        StatsConsumer.__init__(self, connector, errorstrategy, *subscriptionparams)
         self.processor = processor
         self.controller = Consumer.ControllerDelegate(self, controllerconnector, (commandtopicparams[0], commandtopicparams[1], 'auto'))
         self.controllerthread = threading.Thread(target=self.start_controller)
@@ -433,12 +469,18 @@ class Consumer(StatsConsumer):
         try:
             self.processor(event.headers, event.message)
         except Exception as ex:
-            logger.warning("Catched processor exception:")
-            logger.exception(ex)
+            self.handle_error(
+                MessageProcessingErrorEvent(owner=self, 
+                                            exc_cause=ex, 
+                                            exc_description="Catched processor exception", 
+                                            headers=event.headers, message=event.message)
+            )
+            #logger.warning("Catched processor exception:")
+            #logger.exception(ex)
 
     class ControllerDelegate(BaseConsumer):
         def __init__(self, owner, connector, subscriptionparams):
-            BaseConsumer.__init__(self, connector, *subscriptionparams)
+            BaseConsumer.__init__(self, connector, ErrorStrategy(), *subscriptionparams)
             self.owner = owner
 
         @handle_events(AmqErrorEvent)
@@ -629,7 +671,7 @@ class AMQClientFactory:
     A AMQClientFactory should be used to inizialize amq clients
     """
 
-    def __init__(self, amqparams, encoder = JSONEncoder()):
+    def __init__(self, amqparams, encoder = JSONEncoder(), useDLQ = False):
         self.params = {}
         self.params['amqparams'] = {'reconnect_attempts_max': 5,
                                     'reconnect_sleep_initial': 1,
@@ -639,14 +681,21 @@ class AMQClientFactory:
         self.params['amqparams'].update(amqparams)
         self.encoder = encoder
         self.references = weakref.WeakValueDictionary()
+        self.useDLQ = useDLQ
 
     def setMessageQueue(self, messagequeue):
         self.params['messagequeue'] = messagequeue
+        qname = messagequeue.split('/').pop()
         if 'commandtopic' not in self.params:
-            self.params['commandtopic'] = '/topic/%s_cmd' % messagequeue.split('/').pop()
+            self.params['commandtopic'] = '/topic/%s_cmd' % qname
+        if self.useDLQ and 'errortopic' not in self.params:
+            self.params['errortopic'] = '/topic/%s_error' % qname
 
     def setCommandTopic(self, commandtopic):
         self.params['commandtopic'] = commandtopic
+
+    def setErrorTopic(self, errortopic):
+        self.params['errortopic'] = errortopic
 
     def createConsumerClient(self, commandtopic = None):
         if not commandtopic and not 'commandtopic' in self.params:
@@ -672,15 +721,30 @@ class AMQClientFactory:
         self.references[id(obj)] = obj
         return obj
 
-    def createConsumer(self, acallable, messagequeue = None, commandtopic = None):
+    def createErrorStrategy(self, logerrorparams = None, errordest = None, userfunction = None):
+        if logerrorparams == None:
+            logerrorparams = {}
+        errorstrategy = ErrorStrategy()
+        if logerrorparams:
+            errorstrategy.append(MessageProcessingErrorEvent, ErrorLogStrategy(level=logerrorparams.get('level', logging.WARN), logfullmessage=logerrorparams.get('logfullmessage', False)))
+        if errordest:
+            errorstrategy.add(MessageProcessingErrorEvent, ErrorDLQStrategy(errordest))
+        if userfunction:
+            errorstrategy.add(MessageProcessingErrorEvent, ErrorUserFunctStrategy(userfunction))
+        return errorstrategy
+    
+    def createConsumer(self, acallable, messagequeue = None, commandtopic = None, errorstrategy = None):
         if not messagequeue and not 'messagequeue' in self.params:
             raise NameError("Cannot create consumer. No message queue set! Please set the messagequeue argument or call setMessageQueue before")
 
         if not commandtopic and not 'commandtopic' in self.params:
             raise NameError("Cannot create consumer. No command queue set! Please set the commandtopic argument or call setCommandTopic before")
 
+        errorstrategy = errorstrategy or self.createErrorStrategy()
+
         cid = 'consumer-%s.%s.%s' % (socket.gethostname(), os.getpid(), random.randrange(200))
         obj = Consumer(AMQStompConnector(cid, self.params['amqparams'], self.encoder), AMQStompConnector(cid, self.params['amqparams'], self.encoder),
+                       errorstrategy,
                        acallable, 
                        (messagequeue or self.params['messagequeue'], {'activemq.priority':0, 'activemq.prefetchSize':1}, 'client'), 
                        (commandtopic or self.params['commandtopic'], {'activemq.priority':10}, 'auto')
@@ -688,7 +752,7 @@ class AMQClientFactory:
         self.references[id(obj)] = obj
         return obj
 
-    def spawnConsumers(self, f, consumercount):
+    def spawnConsumers(self, f, consumercount, errorstrategy = None):
         def startConsumer(c, i):
             def _startConsumer():
                 #logging.config.fileConfig(os.path.join('etc', 'logging.conf'))
@@ -699,7 +763,7 @@ class AMQClientFactory:
                 c.run()
             return _startConsumer
 
-        processes = [ Process(target=startConsumer(self.createConsumer(f), i))  for i in range(consumercount)]
+        processes = [ Process(target=startConsumer(self.createConsumer(f, errorstrategy=errorstrategy), i))  for i in range(consumercount)]
         # avvio i processi consumer
         logger.debug("Starting consumers")
         for p in processes:
@@ -711,7 +775,6 @@ class AMQClientFactory:
         for o in self.references.values():
             if o is not None:
                 o.disconnect()
-
 
 def main():
     # parametri di connessione ad ActiveMQ
@@ -728,12 +791,13 @@ def main():
     amqfactory = AMQClientFactory(amqparams)
     try:
         amqfactory.setMessageQueue(messagequeue)
+        errorstrategy = amqfactory.createErrorStrategy(logerrorparams = {'level' : logging.WARN}, errordest = '/topic/social_errors')
 
         # istanzio il monitor per statistiche e controllo
         monitor = amqfactory.createConsumerClient()
         monitor.connect()
 
-        processes = amqfactory.spawnConsumers(f, 3)
+        processes = amqfactory.spawnConsumers(f, 3, errorstrategy)
         # creo ed uso il producer:
 
         time.sleep(1)

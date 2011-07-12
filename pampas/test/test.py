@@ -9,6 +9,7 @@ logging.basicConfig(level=logging.DEBUG, format="[%(asctime)s] %(module)15s:%(na
 
 def testf(headers, message):
     print "testf", message
+    raise Exception("test")
 
 class TestPipelineProcessor(unittest.TestCase):
     def setUp(self):
@@ -72,6 +73,11 @@ class TestPipelineProcessor(unittest.TestCase):
             self.factory.disconnectAll()
             raise SystemExit()
         self.assertEqual(reduce(lambda tot, stat: tot + stat['received'], self.monitor.stats(), 0), expectedmessage + 20)
+
+    def WILLBEtestErrorStrategy(self):
+        errorstrategy = self.factory.createErrorStrategy(logerrorparams = {'level' : logging.WARN}, errordest = '/topic/social_errors')
+        consumer = self.factory.createConsumer(testf, errorstrategy=errorstrategy)
+        # consumer errori
 
     def testZStopConsumers(self):
         print "Stopping consumer"
