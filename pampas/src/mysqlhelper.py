@@ -1,8 +1,14 @@
 import MySQLdb
+import MySQLdb.cursors
 import kronos
 import unittest
 import threading
 import time
+import pampas
+import traceback
+import logging
+
+logger = logging.getLogger('pampas.mysqlhelper')
 
 class MySQLDbInserter(object):
     def __init__(self, max_reconnection_attempt = 3, reconnection_delay_seconds = 10):
@@ -16,10 +22,10 @@ class MySQLDbInserter(object):
         self.schedulerrunning = False # bug in shceduler.running
         self.commitlock = threading.Lock()
 
-    def connect(self, *args):
-        self.connectionargs = args
+    def connect(self, *args, **kwargs):
+        self.connectionargs = args, kwargs
         try:
-            self.connection = MySQLdb.connect(*args)
+            self.connection = MySQLdb.connect(*args, **kwargs)
             self.cursor = self.connection.cursor()
             self.current_attempt = 0
         except (AttributeError, MySQLdb.OperationalError):
@@ -29,7 +35,7 @@ class MySQLDbInserter(object):
             logger.info(traceback.format_exc())
             self.current_attempt += 1
             time.sleep(self.reconnection_delay_seconds)
-            self.connect(*args)
+            self.connect(*args, **kwargs)
 
     def scheduleCommit(self, delay):
         self.scheduler.add_interval_task(action = self.commit,
@@ -45,21 +51,23 @@ class MySQLDbInserter(object):
             self.schedulerrunning = True
 
     def commit(self):
-        self.commitlock.acquire()
-        if not self.connection:
-            return
-        self.connection.commit()
-        self.commitlock.release()
+        with self.commitlock:
+            if not self.connection:
+                return
+            try:
+                self.connection.commit()
+            except (AttributeError, MySQLdb.OperationalError):
+                self.connect(*self.connectionargs[0], **self.connectionargs[1])
+                self.connection.commit()
 
-    def execute(self, stmt):
+    def execute(self, stmt, args = None):
         if not self.cursor:
             raise MySQLdb.NotConnectedException()
-
         try:
-            self.cursor.execute(stmt)
+            self.cursor.execute(stmt, args)
         except (AttributeError, MySQLdb.OperationalError):
-            self.connect(*self.connectionargs)
-            self.cursor.execute(stmt)
+            self.connect(*self.connectionargs[0], **self.connectionargs[1])
+            self.cursor.execute(stmt, args)
         return self.cursor
 
 class TestMySQLDbInserter(unittest.TestCase):
@@ -76,7 +84,6 @@ class TestMySQLDbInserter(unittest.TestCase):
 
     def tearDown(self):
         pass
-
 
 if __name__ == '__main__':
     suite = unittest.TestLoader().loadTestsFromTestCase(TestMySQLDbInserter)
