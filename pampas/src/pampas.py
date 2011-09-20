@@ -20,9 +20,9 @@ from pprint import pformat as pf
 from events import EventDispatcher, Event, handle_events
 from multiprocessing import Process
 
-logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(module)15s:%(name)10s:%(lineno)4d [%(levelname)6s]:  %(message)s")
+#logging.basicConfig(level=logging.INFO, format="[%(asctime)s] %(module)15s:%(name)10s:%(lineno)4d [%(levelname)6s]:  %(message)s")
 #logging.config.fileConfig(os.path.join('etc', 'logging.conf'))
-logger = logging.getLogger()
+logger = logging.getLogger('pampas')
 
 
 class Error(Exception):
@@ -123,7 +123,7 @@ class AMQStompConnector(object):
             self.connection.connect(wait=True)
             logger.debug("Connected.")
         except stomp.exception.ReconnectFailedException:
-            logger.warning("Connection error")
+            logger.critical("Connection error")
             trace = sys.exc_info()[2]
             raise ConnectionError('Connection failed!'), None, trace
 
@@ -135,7 +135,6 @@ class AMQStompConnector(object):
             if self.subscriptions:
                 for subscr in self.subscriptions:
                     self.unsubscribe(subscr)
-
             self.connection.disconnect()
 
     def ack(self, headers = None):
@@ -700,24 +699,37 @@ class AMQClientFactory:
     def createConsumerClient(self, commandtopic = None):
         if not commandtopic and not 'commandtopic' in self.params:
             raise NameError("Cannot create consumer monitor. No command queue set! Please set the commandtopic argument or call setCommandTopic before")
-        cid = 'client-%s.%s.%s' % (socket.gethostname(), os.getpid(), random.randrange(200))
-        obj = ConsumerClient(AMQStompConnector(cid, self.params['amqparams'], self.encoder), commandtopic or self.params['commandtopic'])
+        cid = 'client-%s.%s.%s' % ( socket.gethostname(), 
+                                    os.getpid(), 
+                                    random.randrange(200))
+        obj = ConsumerClient( AMQStompConnector(cid, self.params['amqparams'], self.encoder), 
+                              commandtopic or self.params['commandtopic'])
         self.references[id(obj)] = obj
         return obj
 
     def createProducer(self, messagequeue = None, defaultheaders = None):
         if not messagequeue and not 'messagequeue' in self.params:
             raise NameError("Cannot create producer. No message queue set! Please set the messagequeue argument or call setMessageQueue before")
-        cid = 'producer-%s.%s.%s' % (socket.gethostname(), os.getpid(), random.randrange(200))
-        obj = Producer(AMQStompConnector(cid, self.params['amqparams'], self.encoder), messagequeue or self.params['messagequeue'], defaultheaders)
+        cid = 'producer-%s.%s.%s' % (socket.gethostname(), 
+                                     os.getpid(), 
+                                     random.randrange(200))
+        obj = Producer( AMQStompConnector(cid, self.params['amqparams'], self.encoder), 
+                        messagequeue or self.params['messagequeue'], 
+                        defaultheaders)
         self.references[id(obj)] = obj
         return obj
 
     def createBufferedProducer(self, buffersize, messagequeue = None, defaultheaders = None):
         if not messagequeue and not 'messagequeue' in self.params:
             raise NameError("Cannot create producer. No message queue set! Please set the messagequeue argument or call setMessageQueue before")
-        cid = 'producer-%s.%s.%s' % (socket.gethostname(), os.getpid(), random.randrange(200))
-        obj = BufferedProducer(Producer(AMQStompConnector(cid, self.params['amqparams'], self.encoder), messagequeue or self.params['messagequeue'], defaultheaders), buffersize)
+        cid = 'producer-%s.%s.%s' % ( socket.gethostname(), 
+                                      os.getpid(), 
+                                      random.randrange(200) )
+        obj = BufferedProducer(
+                    Producer( AMQStompConnector(cid, self.params['amqparams'], self.encoder), 
+                              messagequeue or self.params['messagequeue'], 
+                              defaultheaders), 
+                    buffersize)
         self.references[id(obj)] = obj
         return obj
 
@@ -726,7 +738,8 @@ class AMQClientFactory:
             logerrorparams = {}
         errorstrategy = ErrorStrategy()
         if logerrorparams:
-            errorstrategy.append(MessageProcessingErrorEvent, ErrorLogStrategy(level=logerrorparams.get('level', logging.WARN), logfullmessage=logerrorparams.get('logfullmessage', False)))
+            errorstrategy.append(MessageProcessingErrorEvent, ErrorLogStrategy(level=logerrorparams.get('level', logging.WARN), 
+                                                                               logfullmessage=logerrorparams.get('logfullmessage', False)))
         if errordest:
             errorstrategy.add(MessageProcessingErrorEvent, ErrorDLQStrategy(errordest))
         if userfunction:
@@ -743,7 +756,8 @@ class AMQClientFactory:
         errorstrategy = errorstrategy or self.createErrorStrategy()
 
         cid = 'consumer-%s.%s.%s' % (socket.gethostname(), os.getpid(), random.randrange(200))
-        obj = Consumer(AMQStompConnector(cid, self.params['amqparams'], self.encoder), AMQStompConnector(cid, self.params['amqparams'], self.encoder),
+        obj = Consumer(AMQStompConnector(cid, self.params['amqparams'], self.encoder), 
+                       AMQStompConnector(cid, self.params['amqparams'], self.encoder),
                        errorstrategy,
                        acallable, 
                        (messagequeue or self.params['messagequeue'], {'activemq.priority':0, 'activemq.prefetchSize':1}, 'client'), 
@@ -763,7 +777,7 @@ class AMQClientFactory:
                 c.run()
             return _startConsumer
 
-        processes = [ Process(target=startConsumer(self.createConsumer(f, errorstrategy=errorstrategy), i))  for i in range(consumercount)]
+        processes = [ Process(target=startConsumer(self.createConsumer(f, errorstrategy=errorstrategy), i)) for i in range(consumercount)]
         # avvio i processi consumer
         logger.debug("Starting consumers")
         for p in processes:
