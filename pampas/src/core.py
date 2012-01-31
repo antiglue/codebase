@@ -1,4 +1,5 @@
 #!/usr/bin/env python2.7
+# vim:syntax=python tabstop=4 shiftwidth=4 expandtab
 # -*- encoding: utf-8 -*-
 
 """Pampas core"""
@@ -780,13 +781,17 @@ class ConsumerClient(object):
             self.connector.unsubscribe(destination=self.replyqueue)
         self.connector.disconnect()
 
-    def stopConsumers(self):
+    def stopConsumer(self, cid):
         headers, message = Consumer.stopmessage()
+        headers['cid'] = '%s.consumer.%s.%s' % (socket.gethostname(), self.commandtopic, cid)
         self.connector.send(message=message, headers=headers,
                   destination=self.commandtopic, ack='auto')
 
-    def ping(self, timeout = DEFAULT_TIMEOUT, expectedcount = -1):
-        return self.send_receive(Consumer.pingmessage(), timeout, expectedcount)
+    def stopConsumers(self):
+        self.stopConsumer('all')
+
+    def ping(self, cid = 'all', timeout = DEFAULT_TIMEOUT, expectedcount = -1):
+        return self.send_receive(Consumer.pingmessage(), timeout, expectedcount, cid=cid)
 
     def stats(self, timeout = DEFAULT_TIMEOUT, expectedcount = -1):
         return self.send_receive(Consumer.statsmessage(), timeout, expectedcount)
@@ -801,8 +806,9 @@ class ConsumerClient(object):
     def __exit__(self, etype, value, tbk):
         self.disconnect()
 
-    def send_receive(self, cmdmsg, timeout, expectedcount):
+    def send_receive(self, cmdmsg, timeout, expectedcount, cid = 'all'):
         headers, message = cmdmsg
+        headers['cid'] = '%s.consumer.%s.%s' % (socket.gethostname(), self.commandtopic, cid)
         cmd = headers[COMMAND_HEADER]
         correlationid = '%s.%d' % (self.connector.cid, self.counter)
         headers.update(
@@ -1054,7 +1060,7 @@ class AMQClientFactory:
     def __init__(self, amqparams, encoder = None, useDLQ = False):
         self.params = {}
         self.params['amqparams'] = {'reconnect_attempts_max': 60,
-                                    'reconnect_sleep_initial': 1,
+                                    'reconnect_sleep_initial': 5,
                                     'reconnect_sleep_jitter':5,
                                     'reconnect_sleep_max': 1000,
                                     'try_loopback_connect': False}
@@ -1144,7 +1150,7 @@ class AMQClientFactory:
             errorstrategy.append(MessageProcessingErrorEvent, ErrorUserFunctStrategy(userfunction))
         return errorstrategy
     
-    def createConsumer(self, acallable, messagequeue = None, commandtopic = None, errorstrategy = None, ctype = Consumer):
+    def createConsumer(self, acallable, messagequeue = None, commandtopic = None, errorstrategy = None, ctype = Consumer, cid = None):
         if not messagequeue and not 'messagequeue' in self.params:
             raise NameError("Cannot create consumer. No message queue set! \
                              Please set the messagequeue argument or call setMessageQueue before")
@@ -1156,13 +1162,21 @@ class AMQClientFactory:
         errorstrategy = errorstrategy or self.createErrorStrategy()
         errorstrategy.setconfig('SkipRedelivered', True)
 
-        cid = 'consumer-%s.%s.%s' % (socket.gethostname(), os.getpid(), random.randrange(200))
+
         msgqueueparams = (messagequeue or self.params['messagequeue'], 
                          {'activemq.priority':0, 'activemq.prefetchSize':1, 'activemq.maximumRedeliveries':2}, 
                          'client')
-        cmdtopicparams = (commandtopic or self.params['commandtopic'], 
-                          {'activemq.priority':10}, 
+
+        #cid = 'consumer-%s.%s.%s' % (socket.gethostname(), os.getpid(), random.randrange(200))
+        commandtopic = commandtopic or self.params['commandtopic']
+        cidbase = '%s.consumer.%s' % (socket.gethostname(), commandtopic)
+        cid = '%s.%s' % (cidbase, cid or random.randrange(200))
+        cmdtopicparams = (commandtopic, 
+                          {'activemq.priority':10,
+                           'selector':"cid = '%s.all' or cid = '%s'" % (cidbase, cid)}, 
                           'auto')
+
+
         obj = ctype(AMQStompConnector(cid, self.params['amqparams'], self.encoder), 
                     AMQStompConnector(cid, self.params['amqparams'], self.encoder),
                     errorstrategy,

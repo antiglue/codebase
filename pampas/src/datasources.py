@@ -1,5 +1,7 @@
 # -*- encoding: utf-8 -*-
+# vim:syntax=python tabstop=4 shiftwidth=4 expandtab
 #$Id$
+#$Date$
 
 """
 Datasource module.
@@ -89,8 +91,10 @@ class MySQLDataSource(DataSource):
     def literal(self, value):
         return self.connection.literal(value)
 
-    def bind(self, stmt, param):
-        return stmt % self.literal(param)
+    #def bind(self, stmt, param):
+    #    return stmt % self.literal(param)
+    def bind(self, stmt, param, escape=True):
+        return string.Template(stmt).safe_substitute({'QUERY':self.literal(param) if escape else param})
 
     def query(self, stmt, *params):
         return [r for r in self.queryiter(stmt, *params)]
@@ -114,6 +118,7 @@ class MySQLDataSource(DataSource):
                     yield result
 
     def _queryiter(self, stmt, *params):
+        print stmt,params
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug("Executing statement %s" % stmt)
         cursor = MySQLdb.cursors.SSDictCursor(self.connection)
@@ -122,7 +127,7 @@ class MySQLDataSource(DataSource):
             cursor.execute('SET CHARACTER SET %s;' % self.forceencoding)
             cursor.execute('SET character_set_connection=%s;' % self.forceencoding)
         try:
-            cursor.execute(stmt, params)
+            cursor.execute(stmt, params or None)
             results = cursor.fetchmany(size=self.fetchsize)
             while results:
                 for result in results:

@@ -1,3 +1,4 @@
+# vim:syntax=python tabstop=4 shiftwidth=4 expandtab
 # to be moved
 from pipeline import Document, DocumentPipeline, ProcessorStatus, StageError
 import json

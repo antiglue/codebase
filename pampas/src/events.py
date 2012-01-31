@@ -1,4 +1,5 @@
-
+# -*- encoding: utf-8
+# vim: set ts=4,sw=4,expandtab
 from functools import wraps, partial
 import traceback
 

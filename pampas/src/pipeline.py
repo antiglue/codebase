@@ -1,3 +1,5 @@
+# vim:syntax=python tabstop=4 shiftwidth=4 expandtab
+
 from xml.dom.minidom import  parse
 from getopt import getopt
 from events import EventDispatcher
@@ -68,7 +70,11 @@ class Document:
             del self._paramMap[param]
 
     def Update(self, params):
-        self._paramMap.update(params)
+        if self._debugSet:
+            for k, v in params.items():
+                self.Set(k,v)
+        else:
+            self._paramMap.update(params)
  
     def doc2pickle(self, pkl_outfilename):
         output = open(pkl_outfilename, 'wb')
@@ -427,6 +433,7 @@ class DocumentPipeline(EventDispatcher):
                 self.logger.critical('Configuration error in stage %s.%s :%s' % \
                                      (self.name, processor_xml.attributes['name'].value, str(ex)))
                 self.logger.exception(traceback.format_exc())
+		raise
 
         self.logger.info("[%s] Loading status handlers.." % self.name)
         handlers_xml = xml.getElementsByTagName("status_handlers")

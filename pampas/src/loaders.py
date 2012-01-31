@@ -1,3 +1,5 @@
+# vim:syntax=python tabstop=4 shiftwidth=4 expandtab
+
 import unittest
 import time
 import core

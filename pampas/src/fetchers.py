@@ -1,4 +1,7 @@
+# vim:syntax=python tabstop=4 shiftwidth=4 expandtab
 # -*- test-case-name: openid.test.test_fetchers -*-
+# based on: https://github.com/openid/python-openid/blob/master/openid/fetchers.py
+
 """
 This module contains the HTTP fetcher interface and several implementations.
 """
